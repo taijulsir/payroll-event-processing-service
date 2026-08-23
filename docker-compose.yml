@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payroll
+      POSTGRES_PASSWORD: payroll
+      POSTGRES_DB: payroll
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U payroll -d payroll']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+# Redis, the API, the worker, and the frontend are added in later phases
+# (architecture.md §20/§26) — this file only provides what Phase 2's Prisma
+# database layer needs to run locally.
+
+volumes:
+  postgres_data:
