@@ -16,9 +16,25 @@ services:
       timeout: 5s
       retries: 10
 
-# Redis, the API, the worker, and the frontend are added in later phases
-# (architecture.md §20/§26) — this file only provides what Phase 2's Prisma
-# database layer needs to run locally.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+# The API, worker, and frontend are added in later phases (architecture.md §20/§26) — this
+# file only provides what's needed locally so far: Phase 2's Prisma database layer, and now
+# Phase 4's BullMQ queue. No password/ACL is configured on Redis — this is a local-only
+# development instance with no data worth protecting, matching Postgres's equally simple
+# local credentials above.
 
 volumes:
   postgres_data:
+  redis_data:
