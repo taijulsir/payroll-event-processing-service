@@ -11,6 +11,7 @@ import { allocateNextSequence } from './sequence-allocation';
 import { isUniqueConstraintViolationOn } from './prisma-errors.util';
 import { DEFAULT_MAX_ATTEMPTS } from './events.constants';
 import { DEFAULT_LIST_LIMIT, ListEventsQueryDto } from './dto/list-events-query.dto';
+import { PayrollEventsQueueService } from '../processing/payroll-events-queue.service';
 
 export interface ListEventsResult {
   items: PayrollEvent[];
@@ -27,13 +28,20 @@ export interface SubmitEventResult {
 export class EventsService {
   private readonly logger = new Logger(EventsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly queue: PayrollEventsQueueService,
+  ) {}
 
   /**
    * The submission transaction (architecture.md §17 / database-design.md §12): advisory
    * lock → sequence allocation → insert `payroll_events` (status defaults to PENDING) →
    * insert its first `event_status_history` row, all in one short transaction with no
-   * external call inside it. No queue enqueue happens here — that is Phase 4's job.
+   * external call inside it — this includes the BullMQ enqueue below, which happens only
+   * after this method's `$transaction(...)` call has returned, i.e. strictly after commit.
+   * Redis is never touched while the Postgres transaction is open (architecture.md §9: "the
+   * API, after its submission transaction commits (never inside it — Redis is not
+   * transactional with Postgres)").
    *
    * Idempotency is enforced by `UNIQUE(idempotency_key)` (database-design.md §7/§10), not
    * by checking for existence before inserting: the insert is always attempted, and only a
@@ -48,6 +56,7 @@ export class EventsService {
     payload: Record<string, unknown>,
   ): Promise<SubmitEventResult> {
     const employeeId = payload.employeeId as string;
+    let result: SubmitEventResult;
 
     try {
       const created = await this.prisma.$transaction(async (tx) => {
@@ -74,12 +83,47 @@ export class EventsService {
       this.logger.log(
         `event accepted: id=${created.id} employeeId=${created.employeeId} eventType=${created.eventType} sequence=${created.sequence}`,
       );
-      return { event: created, deduplicated: false };
+      result = { event: created, deduplicated: false };
     } catch (err) {
       if (isUniqueConstraintViolationOn(err, 'idempotency_key')) {
-        return this.resolveDuplicateSubmission(idempotencyKey, eventType, payload);
+        result = await this.resolveDuplicateSubmission(idempotencyKey, eventType, payload);
+      } else {
+        throw err;
       }
-      throw err;
+    }
+
+    // Strictly after the transaction above has committed (or, for a duplicate, after the
+    // pre-existing row was read back) — never inside it. Safe to attempt even for a
+    // deduplicated event: jobId = event.id makes a redundant enqueue a harmless no-op
+    // (PayrollEventsQueueService), so this doubles as an opportunistic retry of the enqueue
+    // step for an earlier submission whose own enqueue may have failed.
+    await this.enqueueSafely(result.event.id);
+
+    return result;
+  }
+
+  /**
+   * Enqueues the BullMQ job for an already-committed event, without ever failing the
+   * request or rolling back the (already-durable) event if this fails.
+   *
+   * This is the documented DB-commit → Redis-enqueue gap (architecture.md §15): the two
+   * systems have no shared transaction, so a crash or Redis outage between commit and
+   * enqueue is an accepted, designed-for possibility, not an error condition to surface to
+   * the client — the event is genuinely, durably PENDING regardless of whether this
+   * particular call succeeds. The (not-yet-implemented) reconciliation sweep is what
+   * eventually re-enqueues an event that fell through this gap; this method's only
+   * responsibility on failure is to make that gap loudly visible in the logs, not to pretend
+   * it can roll back a commit that has already happened.
+   */
+  private async enqueueSafely(eventId: string): Promise<void> {
+    try {
+      await this.queue.enqueue(eventId);
+    } catch (err) {
+      this.logger.error(
+        `enqueue failed for event ${eventId} — event remains PENDING in PostgreSQL and is ` +
+          `recoverable by the future reconciliation sweep (architecture.md §15): ` +
+          `${(err as Error).message}`,
+      );
     }
   }
 
