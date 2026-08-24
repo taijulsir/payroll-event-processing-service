@@ -4,6 +4,10 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
+# npm ci's postinstall runs `prisma generate`, which requires prisma/schema.prisma to be
+# present — copied here, before npm ci, rather than relying on the later `COPY . .` in the
+# build stage (prod-deps below has no such later copy at all, so it would fail every time).
+COPY prisma ./prisma
 RUN npm ci
 
 # ---- build: compile TypeScript ----
@@ -17,6 +21,7 @@ RUN npm run build
 FROM node:20-alpine AS prod-deps
 WORKDIR /app
 COPY package*.json ./
+COPY prisma ./prisma
 RUN npm ci --omit=dev
 
 # ---- runtime: minimal final image, shared by both api and worker services ----

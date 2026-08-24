@@ -18,3 +18,10 @@ export const REDIS_CONNECTION = Symbol('REDIS_CONNECTION');
 
 /** DI token for the BullMQ Queue instance. */
 export const PAYROLL_EVENTS_QUEUE = Symbol('PAYROLL_EVENTS_QUEUE');
+
+/**
+ * DI token for the BullMQ Worker instance that consumes `payroll-events` (this phase).
+ * Provided only by WorkerProcessingModule, which is imported by worker.ts alone — never by
+ * AppModule — so the API process never constructs a Worker and never starts consuming jobs.
+ */
+export const PAYROLL_EVENTS_WORKER = Symbol('PAYROLL_EVENTS_WORKER');
