@@ -47,7 +47,7 @@ flowchart TD
 | **PostgreSQL** | The single source of durable, authoritative state — current status, attempts, result, and full transition history for every event. |
 | **Redis / BullMQ** | The work queue only. Holds pending jobs, not business state. If Redis is unavailable when a job would be enqueued, the event stays durably `PENDING` in Postgres and is recovered later (see [Failure and Recovery](#failure-and-recovery)). |
 | **Worker** (`backend/src/worker.ts`) | A second entrypoint sharing the same application code as the API. Consumes jobs, claims events with an atomic compare-and-swap, invokes the provider, persists the outcome, and runs the periodic recovery/reconciliation sweeps. Runs as a separate process from the API. |
-| **Simulated Payroll Provider** (`backend/src/processing/simulated-payroll-provider.ts`) | An in-process stand-in for a real external payroll system. Performs basic business validation, adds latency, and fails transiently or permanently at configurable rates — no real external integration, per the assignment. |
+| **Simulated Payroll Provider** (`backend/src/processing/simulated-payroll-provider.ts`) | An in-process stand-in for a real external payroll system — no real external integration, per the assignment. Deterministic, not random: it succeeds unless `employeeId` contains a reserved marker substring, which forces a transient or permanent failure on demand (see [Testing](#testing)). |
 | **Frontend** (`frontend/`) | A minimal Next.js UI that talks to the API directly from the browser to submit and observe events — see [Frontend](#frontend). |
 
 ## Core Guarantees
@@ -146,9 +146,10 @@ variable substitution, not read by the application:
 | `FRONTEND_ORIGIN` | `http://localhost:3001` | The single allowed CORS origin — must be the browser-reachable frontend URL, never a Docker-internal hostname |
 | `DATABASE_URL` | `postgresql://payroll:payroll@localhost:5432/payroll?schema=public` | Prisma/PostgreSQL connection string |
 | `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis connection used for BullMQ |
-| `PROVIDER_TRANSIENT_FAILURE_RATE` | `0.2` | Simulated provider's random transient-failure rate |
-| `PROVIDER_PERMANENT_FAILURE_RATE` | `0.05` | Simulated provider's random permanent-failure rate |
-| `PROVIDER_MIN_LATENCY_MS` / `PROVIDER_MAX_LATENCY_MS` | `200` / `2000` | Simulated provider latency range |
+
+The simulated payroll provider (`backend/src/processing/simulated-payroll-provider.ts`) has no
+environment configuration — it is deterministic, not randomized (see
+[Known Limitations](#known-limitations)).
 
 **`frontend/.env.example`** — read at build time only (this is a static export; there is no
 frontend server at runtime):
@@ -316,6 +317,30 @@ Unit tests live under `backend/src/**/*.spec.ts` (10 suites); integration/e2e te
 concurrent-claim races, retry/backoff timing, ordering, stale-processing recovery, and
 reconciliation — not mocked infrastructure.
 
+**Running `test:e2e` locally, with `docker compose up` also running**: each e2e spec boots its
+own in-process NestJS application (via `Test.createTestingModule`), including its own BullMQ
+worker(s), and connects to whatever Postgres/Redis `backend/.env` points at — the same instances
+`docker compose`'s own `api`/`worker` containers use by default (same exposed ports). If the
+Docker `worker` container is left running while you run `npm run test:e2e` from the host, it
+will race the tests' own workers to claim jobs from the same `payroll-events` queue — since only
+one worker can ever win a given job, this produces spurious e2e failures (a test's own worker
+losing a job it expected to process, or extra history rows appended by the Docker worker mid-test)
+that are an artifact of the duplicate consumer, not a bug in the code under test.
+
+Correct local procedure: stop (not necessarily remove) the containers that consume the queue
+before running e2e tests, and restart them afterward if you want the full stack running again:
+
+```bash
+docker compose stop api worker    # postgres/redis stay up — e2e needs them
+cd backend && npm run test:e2e
+docker compose start api worker   # optional, if you want the full stack running again
+```
+
+This is a local-workflow caveat only, not a production or architecture concern:
+**CI never hits this** — `.github/workflows/ci.yml`'s `e2e` job uses isolated, ephemeral GitHub
+Actions Postgres/Redis service containers with no `api`/`worker` container attached to them at
+all, so there is never a second consumer to race.
+
 From `frontend/`, `npm run typecheck` and `npm run build` validate the frontend (there is no
 frontend test framework — the assignment's testing requirements are backend-scenario-focused).
 
@@ -405,9 +430,11 @@ The frontend also shows the live `/health` status in its navigation bar.
 ## Known Limitations
 
 - No authentication or authorization — explicitly out of scope for this assignment.
-- The simulated provider's random failure rates (`PROVIDER_TRANSIENT_FAILURE_RATE`,
-  `PROVIDER_PERMANENT_FAILURE_RATE`) are for manual/demo purposes; automated tests use
-  deterministic failure triggers instead, not random chance.
+- The simulated provider is fully deterministic — it has no random failure rate and no
+  simulated latency. It succeeds unless `employeeId` contains a reserved marker substring
+  (`FORCE_PROVIDER_FAILURE` / `FORCE_PROVIDER_TRANSIENT_FAILURE`), which forces a permanent or
+  transient failure respectively. This is a deliberate choice, not a shortcut: automated tests
+  need to force a specific outcome without depending on random chance.
 - Provider invocation is at-least-once, not exactly-once, in the narrow crash window described
   under [Core Guarantees](#core-guarantees) — acceptable only because the provider is simulated
   and has no real external side effect.

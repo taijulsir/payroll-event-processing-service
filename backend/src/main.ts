@@ -1,11 +1,18 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { configureBodyParser } from './http-bootstrap';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // `bodyParser: false` + configureBodyParser() (rather than Nest's default-registered
+  // parsers) is the documented way to apply a non-default body size limit — see
+  // http-bootstrap.ts for the limit value and full rationale. NestExpressApplication (not the
+  // generic INestApplication) is required for `useBodyParser` to be available.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
+  configureBodyParser(app);
   app.use(helmet());
 
   // CORS: the frontend is a static export that calls this API directly from the browser
