@@ -8,6 +8,12 @@ export function formatEventType(eventType: string): string {
   return EVENT_TYPE_LABELS[eventType] ?? eventType;
 }
 
+export function formatSequence(seq: string | number): string {
+  const num = Number(seq);
+  if (Number.isNaN(num)) return `#${seq}`;
+  return `#${num.toString().padStart(4, '0')}`;
+}
+
 export function formatDateTime(iso: string | null): string {
   if (!iso) return '—';
   const date = new Date(iso);
