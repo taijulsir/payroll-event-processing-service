@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, development]
+  push:
+    branches: [main, development]
+
+jobs:
+  # Lint, typecheck, build, Prisma schema validation, and unit tests — none of these need
+  # Postgres/Redis, so they all run as sequential steps in one job (architecture.md §21,
+  # stages 1-4): one checkout/install pays for all four checks, and the job fails fast on the
+  # first broken step.
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - run: npm run prisma:validate
+
+      - run: npm test
+
+  # Integration/e2e tests against real Postgres + Redis (architecture.md §21, stage 5) —
+  # GitHub Actions service containers, not docker compose: lighter weight than standing up the
+  # full Compose topology, and this is the same real-infrastructure coverage the docker-build
+  # job's plain image build does not exercise.
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payroll
+          POSTGRES_PASSWORD: payroll
+          POSTGRES_DB: payroll
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payroll -d payroll"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://payroll:payroll@localhost:5432/payroll?schema=public
+      REDIS_HOST: localhost
+      REDIS_PORT: '6379'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      # prisma migrate deploy — never `migrate dev`/`migrate reset` (non-interactive,
+      # applies existing migrations only, exactly what a CI database needs).
+      - run: npx prisma migrate deploy
+
+      - run: npm run test:e2e
+
+  # Docker build validation (architecture.md §21, stage 6). A single `docker build` with no
+  # --target defaults to the Dockerfile's final `runtime` stage, which transitively builds
+  # deps -> build -> prod-deps -> runtime — this already validates every stage, including the
+  # `build` stage the docker-compose.yml `migrate` service targets, in one invocation. No
+  # `docker compose up`: the e2e job above already proves the application works against real
+  # Postgres/Redis, so a full Compose smoke test here would only duplicate that coverage more
+  # slowly. No frontend build step — frontend/ is currently empty.
+  docker-build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: docker build ./backend
