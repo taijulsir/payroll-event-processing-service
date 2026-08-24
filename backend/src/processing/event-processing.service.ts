@@ -18,15 +18,26 @@ export type ProcessEventOutcome =
   | 'already-processing' // event was already PROCESSING — safe no-op
   | 'lost-race' // a CAS this call attempted matched zero rows — another writer won first
   | 'missing' // no event exists for this id
-  | 'not-processing'; // R4 only: recoverStaleProcessing found the event already moved on from PROCESSING
+  | 'not-processing' // R4 only: recoverStaleProcessing found the event already moved on from PROCESSING
+  | 'ordering-blocked'; // per-employee ordering: an earlier, non-terminal sibling exists — not claimed, not an error
 
 export interface ProcessEventResult {
   outcome: ProcessEventOutcome;
   event?: PayrollEvent;
 }
 
-/** Internal-only: the outcome of the PENDING -> PROCESSING claim step. */
-type ClaimResult = { outcome: 'claimed'; event: PayrollEvent } | { outcome: 'lost-race' };
+/**
+ * Internal-only: the outcome of the PENDING -> PROCESSING claim step.
+ *
+ * `'blocked-by-ordering'` and `'lost-race'` are both produced by the SAME combined CAS
+ * matching zero rows (see `claimForProcessing`) — the distinction between them comes from a
+ * diagnostic-only follow-up read, never from the write itself. That read is not the
+ * correctness mechanism; the combined `UPDATE ... WHERE ... AND NOT EXISTS (...)` is.
+ */
+type ClaimResult =
+  | { outcome: 'claimed'; event: PayrollEvent }
+  | { outcome: 'lost-race' }
+  | { outcome: 'blocked-by-ordering' };
 
 /**
  * The worker-side event lifecycle logic (architecture.md §8/§11/§13/§16/§17,
@@ -101,7 +112,7 @@ export class EventProcessingService {
     // and the CAS update below, any other worker could have already changed the row; that is
     // fine, because the update's own WHERE clause is what actually decides the outcome, not
     // what we observed a moment ago.
-    const claim = await this.claimForProcessing(eventId);
+    const claim = await this.claimForProcessing(eventId, event.employeeId, event.sequence);
     if (claim.outcome === 'lost-race') {
       // Another worker's CAS won the race between our read and this update. Expected under
       // concurrent processing, not an error (database-design.md §13). Because we never won
@@ -109,6 +120,18 @@ export class EventProcessingService {
       // "duplicate jobs cannot invoke the provider twice."
       this.logger.log(`PENDING -> PROCESSING lost race: eventId=${eventId}`);
       return { outcome: 'lost-race' };
+    }
+
+    if (claim.outcome === 'blocked-by-ordering') {
+      // Per-employee ordering (architecture.md §12): an earlier, non-terminal sibling exists
+      // for this employee. Not an error, not a failure, not a race loss — the caller
+      // (payroll-event-processor.ts) turns this into a BullMQ defer (moveToDelayed +
+      // DelayedError), never a thrown "real" error, so no attempt/history/provider side
+      // effect occurs here. The event's status is untouched (still PENDING).
+      this.logger.log(
+        `ordering blocked: eventId=${eventId} employeeId=${event.employeeId} sequence=${event.sequence}`,
+      );
+      return { outcome: 'ordering-blocked' };
     }
 
     // Transaction boundary (architecture.md §17, database-design.md §12): the claim above has
@@ -120,39 +143,82 @@ export class EventProcessingService {
   }
 
   /**
-   * The atomic compare-and-swap transition, exactly as documented in database-design.md §12
-   * ("Processing start") and §18's query example:
+   * The atomic compare-and-swap transition, combining TWO guards into one statement per
+   * architecture.md §12's explicit, non-negotiable requirement: "the 'is there an earlier
+   * unfinished sibling' check and the eventual CAS to PROCESSING must be combined into the
+   * same guarded database statement... not performed as two separate steps. If done as two
+   * separate steps, a narrow window opens where two same-employee jobs could both pass the
+   * ordering check moments apart, before either has flipped status." Database-design.md
+   * §12/§18's own literal claim SQL and its separate ordering-check query example (§18) are
+   * folded together here into one statement:
    *
    *   UPDATE payroll_events
-   *   SET status = 'PROCESSING', processing_started_at = now(), attempts = attempts + 1
-   *   WHERE id = $1 AND status = 'PENDING'
+   *   SET status='PROCESSING', processing_started_at=now(), attempts=attempts+1, updated_at=now()
+   *   WHERE id=$1 AND status='PENDING'
+   *     AND NOT EXISTS (
+   *       SELECT 1 FROM payroll_events
+   *       WHERE employee_id=$2 AND sequence<$3 AND status NOT IN ('SUCCEEDED','FAILED')
+   *     )
    *
-   * Expressed here via Prisma's `updateMany`, not raw SQL: `updateMany`'s `where` clause is
-   * itself the atomic guard, and its returned `count` is how we detect whether *this* call
-   * was the one that won — the same technique the literal `UPDATE ... RETURNING *` in the
-   * docs uses, just through Prisma's query builder instead of a hand-written statement.
+   * `$2`/`$3` (employeeId/sequence) are the caller's own already-known, immutable values for
+   * this row (read once by `processEvent` before this method is ever called) — bound
+   * parameters, not a self-correlated subquery, which Prisma's query builder cannot express
+   * at all (no self-relation exists on PayrollEvent) and raw SQL doesn't need here either,
+   * since nothing about employeeId/sequence changes after insert. This is the one place in
+   * `EventProcessingService` that uses raw SQL, isolated the same way the advisory lock in
+   * sequence-allocation.ts is — Prisma's `updateMany` cannot express "no OTHER row exists
+   * matching some condition" as part of the same statement.
+   *
+   * `sequence < $3` is vacuously true (matches zero rows) when `$3` is an employee's first
+   * sequence number (1, `CHECK(sequence > 0)` rules out 0/negative) — `NOT EXISTS` is
+   * trivially satisfied, so sequence 1 is never blocked, with no special-case code needed.
+   * No new index is required: the existing `UNIQUE(employee_id, sequence)` constraint's
+   * supporting btree index already has `employee_id` leading and `sequence` second, exactly
+   * matching this subquery's access pattern.
+   *
+   * A zero-row match is now ambiguous between two causes — another worker already won the
+   * claim (`status` no longer `'PENDING'`), or the row is still `PENDING` but blocked by a
+   * non-terminal sibling (`NOT EXISTS` was false). One additional single-column read
+   * distinguishes them; per the approved design, this read is diagnostic only, never the
+   * correctness mechanism — the guarded `UPDATE` above is what actually decided the outcome.
    *
    * The update and the append-only history insert happen inside the same transaction.
    */
-  private async claimForProcessing(eventId: string): Promise<ClaimResult> {
+  private async claimForProcessing(
+    eventId: string,
+    employeeId: string,
+    sequence: bigint,
+  ): Promise<ClaimResult> {
     return this.prisma.$transaction(async (tx) => {
-      const { count } = await tx.payrollEvent.updateMany({
-        where: { id: eventId, status: 'PENDING' },
-        data: {
-          status: 'PROCESSING',
-          processingStartedAt: new Date(),
-          attempts: { increment: 1 },
-          updatedAt: new Date(),
-        },
-      });
+      const count = await tx.$executeRaw`
+        UPDATE payroll_events
+        SET status = 'PROCESSING', processing_started_at = now(), attempts = attempts + 1, updated_at = now()
+        WHERE id = ${eventId}::uuid
+          AND status = 'PENDING'
+          AND NOT EXISTS (
+            SELECT 1 FROM payroll_events
+            WHERE employee_id = ${employeeId}
+              AND sequence < ${sequence}
+              AND status NOT IN ('SUCCEEDED', 'FAILED')
+          )
+      `;
 
       if (count === 0) {
+        // Diagnostic-only read — not the correctness mechanism (see method doc above). The
+        // guarded UPDATE has already committed nothing; this purely classifies WHY.
+        const current = await tx.payrollEvent.findUnique({
+          where: { id: eventId },
+          select: { status: true },
+        });
+        if (current?.status === 'PENDING') {
+          return { outcome: 'blocked-by-ordering' as const };
+        }
         return { outcome: 'lost-race' as const };
       }
 
       // Read the row back (within the same transaction, so it sees our own uncommitted
       // write) purely to get the post-increment `attempts` value for the history row — this
-      // read is not part of the atomicity guarantee, the `updateMany` above already is.
+      // read is not part of the atomicity guarantee, the guarded UPDATE above already is.
       const updated = await tx.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
 
       await tx.eventStatusHistory.create({

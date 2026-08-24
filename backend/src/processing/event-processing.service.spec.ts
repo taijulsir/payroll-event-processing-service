@@ -4,38 +4,70 @@ import type { PayrollProvider, PayrollProviderOutcome } from './payroll-provider
 /**
  * Pure branch-logic coverage with a fake PrismaService — this is deliberately NOT where the
  * CAS's concurrency guarantee is proven (that requires real Postgres and lives in
- * test/payroll-provider.e2e-spec.ts, test/worker-processing.e2e-spec.ts, and
- * test/retry-backoff.e2e-spec.ts). This spec checks that each of EventProcessingService's
- * branches reads its inputs, calls Prisma, and calls the provider (or doesn't) the way it
- * should.
+ * test/payroll-provider.e2e-spec.ts, test/worker-processing.e2e-spec.ts,
+ * test/retry-backoff.e2e-spec.ts, and test/per-employee-ordering.e2e-spec.ts). This spec
+ * checks that each of EventProcessingService's branches reads its inputs, calls Prisma, and
+ * calls the provider (or doesn't) the way it should.
  */
 describe('EventProcessingService', () => {
   /**
-   * `attempts` is tracked as mutable state across a test's calls (not hardcoded), because
-   * real behavior only increments it on the CLAIM step's own `updateMany` (never on the
-   * retry-transition or finalize steps) — several of this phase's tests need to observe a
-   * realistic, correctly-incremented value across a claim -> retry/finalize sequence within
-   * one `processEvent()` call.
+   * `attempts`/`status` are tracked as mutable state across a test's calls (not hardcoded),
+   * because real behavior only mutates them on an actual matching write — several tests need
+   * to observe realistic values across a claim -> retry/finalize sequence within one
+   * `processEvent()` call.
+   *
+   * Per-employee ordering design: `claimForProcessing`'s combined ordering-aware CAS is
+   * `tx.$executeRaw` (raw SQL — see event-processing.service.ts for why Prisma's query
+   * builder cannot express it), not `tx.payrollEvent.updateMany`. The exact SQL text is
+   * proven against real Postgres in the standalone smoke test performed during
+   * implementation and in the e2e suite — this fake only reproduces `$executeRaw`'s
+   * observable contract (affected-row count; on a match, flips status to PROCESSING and
+   * increments attempts, exactly like the real UPDATE's SET clause). `updateMany` remains
+   * used, unchanged, by every OTHER transition (finalizeSuccess/retryTransition/
+   * finalizeFailure) — R3/R4 never call claimForProcessing at all, so their tests below are
+   * entirely unaffected by this fixture split.
    */
   const buildFakePrisma = (event: Record<string, unknown> | null) => {
     let currentAttempts = (event?.attempts as number | undefined) ?? 0;
+    let currentStatus = (event?.status as string | undefined) ?? 'PENDING';
+
+    const executeRaw = jest.fn().mockImplementation(() => {
+      if (currentStatus !== 'PENDING') {
+        return Promise.resolve(0);
+      }
+      currentStatus = 'PROCESSING';
+      currentAttempts += 1;
+      return Promise.resolve(1);
+    });
 
     const updateMany = jest.fn().mockImplementation((args: { data?: Record<string, unknown> }) => {
       const attemptsOp = args?.data?.attempts as { increment?: number } | undefined;
       if (attemptsOp?.increment) {
         currentAttempts += attemptsOp.increment;
       }
+      if (typeof args?.data?.status === 'string') {
+        currentStatus = args.data.status;
+      }
       return Promise.resolve({ count: 1 });
     });
+
+    // The claim step's diagnostic-only read after a failed $executeRaw — distinguishes
+    // lost-race from ordering-blocked, never the correctness mechanism. Distinct from
+    // findUniqueOrThrow below, which is only used after a successful write.
+    const txFindUnique = jest
+      .fn()
+      .mockImplementation(() => Promise.resolve({ status: currentStatus }));
+
     const findUniqueOrThrow = jest
       .fn()
       .mockImplementation(() =>
-        Promise.resolve({ ...event, status: 'PROCESSING', attempts: currentAttempts }),
+        Promise.resolve({ ...event, status: currentStatus, attempts: currentAttempts }),
       );
     const create = jest.fn().mockResolvedValue(undefined);
 
     const tx = {
-      payrollEvent: { updateMany, findUniqueOrThrow },
+      $executeRaw: executeRaw,
+      payrollEvent: { updateMany, findUniqueOrThrow, findUnique: txFindUnique },
       eventStatusHistory: { create },
     };
 
@@ -44,7 +76,7 @@ describe('EventProcessingService', () => {
       $transaction: jest.fn((fn: (tx: unknown) => unknown) => fn(tx)),
     };
 
-    return { prisma, tx, updateMany, findUniqueOrThrow, create };
+    return { prisma, tx, executeRaw, updateMany, findUniqueOrThrow, txFindUnique, create };
   };
 
   const buildFakeProvider = (outcome: PayrollProviderOutcome) => {
@@ -93,10 +125,13 @@ describe('EventProcessingService', () => {
     expect(provider.apply).not.toHaveBeenCalled();
   });
 
-  it('reports a lost race when the initial CAS matches zero rows, without calling the provider', async () => {
-    const event = { id: 'e1', status: 'PENDING' };
-    const { prisma, updateMany, create } = buildFakePrisma(event);
-    updateMany.mockResolvedValueOnce({ count: 0 });
+  it('reports a lost race when the combined claim CAS matches zero rows because another worker already claimed it, without calling the provider', async () => {
+    const event = { id: 'e1', status: 'PENDING', employeeId: 'emp-1', sequence: 1n };
+    const { prisma, executeRaw, txFindUnique, create } = buildFakePrisma(event);
+    // Simulate: another worker's claim already committed (status no longer PENDING) by the
+    // time this attempt's combined CAS runs — the diagnostic read must see that, not PENDING.
+    executeRaw.mockImplementationOnce(() => Promise.resolve(0));
+    txFindUnique.mockResolvedValueOnce({ status: 'PROCESSING' });
     const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
     const service = new EventProcessingService(prisma as never, provider);
 
@@ -114,32 +149,32 @@ describe('EventProcessingService', () => {
       employeeId: 'emp-1',
       eventType: 'ADDRESS_CHANGE',
       payload: {},
+      sequence: 1n,
       maxAttempts: 5,
     };
-    const { prisma, updateMany, create } = buildFakePrisma(event);
+    const { prisma, executeRaw, updateMany, create } = buildFakePrisma(event);
     const providerResult = { providerReference: 'sim-e1' };
     const provider = buildFakeProvider({ outcome: 'SUCCESS', result: providerResult });
     const service = new EventProcessingService(prisma as never, provider);
 
     const result = await service.processEvent('e1');
 
-    // First updateMany call: the PENDING -> PROCESSING claim.
-    expect(updateMany).toHaveBeenNthCalledWith(1, {
-      where: { id: 'e1', status: 'PENDING' },
-      data: expect.objectContaining({ status: 'PROCESSING', attempts: { increment: 1 } }),
-    });
+    // The claim itself is the combined ordering-aware raw SQL CAS — its exact SQL shape is
+    // proven against real Postgres separately; here we only confirm it was attempted once.
+    expect(executeRaw).toHaveBeenCalledTimes(1);
     expect(provider.apply).toHaveBeenCalledWith({
       eventId: 'e1',
       employeeId: 'emp-1',
       eventType: 'ADDRESS_CHANGE',
       payload: {},
     });
-    // Second updateMany call: the PROCESSING -> SUCCEEDED finalize.
-    expect(updateMany).toHaveBeenNthCalledWith(2, {
+    // The only updateMany call is the PROCESSING -> SUCCEEDED finalize.
+    expect(updateMany).toHaveBeenCalledTimes(1);
+    expect(updateMany).toHaveBeenCalledWith({
       where: { id: 'e1', status: 'PROCESSING' },
       data: expect.objectContaining({ status: 'SUCCEEDED', result: providerResult }),
     });
-    expect(create).toHaveBeenNthCalledWith(2, {
+    expect(create).toHaveBeenCalledWith({
       data: {
         eventId: 'e1',
         fromStatus: 'PROCESSING',
@@ -159,6 +194,7 @@ describe('EventProcessingService', () => {
       employeeId: 'emp-1',
       eventType: 'ADDRESS_CHANGE',
       payload: {},
+      sequence: 1n,
       maxAttempts: 5,
     };
     const { prisma, updateMany, create } = buildFakePrisma(event);
@@ -171,8 +207,8 @@ describe('EventProcessingService', () => {
 
     const result = await service.processEvent('e1');
 
-    expect(updateMany).toHaveBeenCalledTimes(2); // claim + finalize — no retry transition
-    expect(updateMany).toHaveBeenNthCalledWith(2, {
+    expect(updateMany).toHaveBeenCalledTimes(1); // only the finalize — claim is $executeRaw
+    expect(updateMany).toHaveBeenCalledWith({
       where: { id: 'e1', status: 'PROCESSING' },
       data: expect.objectContaining({
         status: 'FAILED',
@@ -180,7 +216,7 @@ describe('EventProcessingService', () => {
         failureType: 'PERMANENT',
       }),
     });
-    expect(create).toHaveBeenNthCalledWith(2, {
+    expect(create).toHaveBeenCalledWith({
       data: {
         eventId: 'e1',
         fromStatus: 'PROCESSING',
@@ -200,6 +236,7 @@ describe('EventProcessingService', () => {
       employeeId: 'emp-1',
       eventType: 'ADDRESS_CHANGE',
       payload: {},
+      sequence: 1n,
       maxAttempts: 5,
     };
     const { prisma, updateMany } = buildFakePrisma(event);
@@ -212,7 +249,7 @@ describe('EventProcessingService', () => {
 
     await service.processEvent('e1');
 
-    const finalizeCall = updateMany.mock.calls[1][0];
+    const finalizeCall = updateMany.mock.calls[0][0];
     expect(finalizeCall.data.result).toBeUndefined();
   });
 
@@ -224,6 +261,7 @@ describe('EventProcessingService', () => {
         employeeId: 'emp-1',
         eventType: 'ADDRESS_CHANGE',
         payload: {},
+        sequence: 1n,
         attempts: 1, // this claim becomes attempt 2 of 5 — budget remains
         maxAttempts: 5,
       };
@@ -237,9 +275,9 @@ describe('EventProcessingService', () => {
 
       const result = await service.processEvent('e1');
 
-      expect(updateMany).toHaveBeenCalledTimes(2); // claim + retry transition
+      expect(updateMany).toHaveBeenCalledTimes(1); // only the retry transition — claim is $executeRaw
       // The retry transition must NOT touch `attempts` — only the claim step does.
-      const retryCallArgs = updateMany.mock.calls[1][0];
+      const retryCallArgs = updateMany.mock.calls[0][0];
       expect(retryCallArgs).toEqual({
         where: { id: 'e1', status: 'PROCESSING' },
         data: expect.objectContaining({ status: 'PENDING' }),
@@ -248,7 +286,7 @@ describe('EventProcessingService', () => {
       expect(retryCallArgs.data.processingFinishedAt).toBeUndefined(); // not terminal
       expect(retryCallArgs.data.failureType).toBeUndefined(); // status column only, no failure fields
 
-      expect(create).toHaveBeenNthCalledWith(2, {
+      expect(create).toHaveBeenCalledWith({
         data: {
           eventId: 'e1',
           fromStatus: 'PROCESSING',
@@ -269,19 +307,17 @@ describe('EventProcessingService', () => {
         employeeId: 'emp-1',
         eventType: 'ADDRESS_CHANGE',
         payload: {},
+        sequence: 1n,
         attempts: 2, // already retried twice; this claim becomes attempt 3
         maxAttempts: 5,
       };
-      const { prisma, updateMany, create } = buildFakePrisma(event);
+      const { prisma, executeRaw, create } = buildFakePrisma(event);
       const provider = buildFakeProvider({ outcome: 'SUCCESS', result: { ok: true } });
       const service = new EventProcessingService(prisma as never, provider);
 
       const result = await service.processEvent('e1');
 
-      expect(updateMany.mock.calls[0][0]).toEqual({
-        where: { id: 'e1', status: 'PENDING' },
-        data: expect.objectContaining({ attempts: { increment: 1 } }),
-      });
+      expect(executeRaw).toHaveBeenCalledTimes(1);
       expect(create).toHaveBeenNthCalledWith(1, {
         data: {
           eventId: 'e1',
@@ -300,6 +336,7 @@ describe('EventProcessingService', () => {
         employeeId: 'emp-1',
         eventType: 'ADDRESS_CHANGE',
         payload: {},
+        sequence: 1n,
         attempts: 4, // this claim becomes attempt 5 of 5 — budget exhausted by this attempt
         maxAttempts: 5,
       };
@@ -313,8 +350,8 @@ describe('EventProcessingService', () => {
 
       const result = await service.processEvent('e1');
 
-      expect(updateMany).toHaveBeenCalledTimes(2); // claim + terminal finalize — no retry transition
-      expect(updateMany).toHaveBeenNthCalledWith(2, {
+      expect(updateMany).toHaveBeenCalledTimes(1); // only the terminal finalize
+      expect(updateMany).toHaveBeenCalledWith({
         where: { id: 'e1', status: 'PROCESSING' },
         data: expect.objectContaining({
           status: 'FAILED',
@@ -322,7 +359,7 @@ describe('EventProcessingService', () => {
           failureReason: 'still down',
         }),
       });
-      expect(create).toHaveBeenNthCalledWith(2, {
+      expect(create).toHaveBeenCalledWith({
         data: {
           eventId: 'e1',
           fromStatus: 'PROCESSING',
@@ -342,11 +379,11 @@ describe('EventProcessingService', () => {
         employeeId: 'emp-1',
         eventType: 'ADDRESS_CHANGE',
         payload: {},
+        sequence: 1n,
         attempts: 0,
         maxAttempts: 5,
       };
       const { prisma, updateMany } = buildFakePrisma(event);
-      updateMany.mockResolvedValueOnce({ count: 1 }); // claim succeeds
       updateMany.mockResolvedValueOnce({ count: 0 }); // retry-transition CAS loses
       const provider = buildFakeProvider({
         outcome: 'FAILURE',
@@ -358,6 +395,53 @@ describe('EventProcessingService', () => {
       const result = await service.processEvent('e1');
 
       expect(result).toEqual({ outcome: 'lost-race' });
+    });
+  });
+
+  describe('Per-employee ordering: claimForProcessing blocked-by-ordering branch', () => {
+    it('reports ordering-blocked when the combined CAS matches zero rows and the row is still PENDING (no attempts increment, no provider call, no history)', async () => {
+      const event = { id: 'e1', status: 'PENDING', employeeId: 'emp-1', sequence: 2n };
+      const { prisma, executeRaw, txFindUnique, updateMany, create } = buildFakePrisma(event);
+      // Simulate the combined CAS failing specifically because of the NOT EXISTS ordering
+      // predicate — status stays PENDING (nothing wrote to it), unlike the lost-race case.
+      executeRaw.mockImplementationOnce(() => Promise.resolve(0));
+      const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
+      const service = new EventProcessingService(prisma as never, provider);
+
+      const result = await service.processEvent('e1');
+
+      expect(result).toEqual({ outcome: 'ordering-blocked' });
+      expect(txFindUnique).toHaveBeenCalledWith({ where: { id: 'e1' }, select: { status: true } });
+      expect(updateMany).not.toHaveBeenCalled();
+      expect(create).not.toHaveBeenCalled();
+      expect(provider.apply).not.toHaveBeenCalled();
+    });
+
+    it('the combined claim CAS is called with employeeId and sequence as bound parameters', async () => {
+      const event = {
+        id: 'e1',
+        status: 'PENDING',
+        employeeId: 'emp-42',
+        eventType: 'ADDRESS_CHANGE',
+        payload: {},
+        sequence: 7n,
+        maxAttempts: 5,
+      };
+      const { prisma, executeRaw } = buildFakePrisma(event);
+      const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
+      const service = new EventProcessingService(prisma as never, provider);
+
+      await service.processEvent('e1');
+
+      expect(executeRaw).toHaveBeenCalledTimes(1);
+      // executeRaw is invoked as a tagged template: (stringsArray, ...values). The bound
+      // values passed after the strings array are eventId, employeeId, sequence in that
+      // order — asserting they were forwarded, not the full SQL text (proven against real
+      // Postgres separately).
+      const callArgs = executeRaw.mock.calls[0];
+      expect(callArgs).toContain('e1');
+      expect(callArgs).toContain('emp-42');
+      expect(callArgs).toContain(7n);
     });
   });
 
