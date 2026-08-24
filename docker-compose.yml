@@ -29,16 +29,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-off job, not a long-running service: applies pending Prisma migrations against
-  # `postgres`, then exits. Deliberately targets the Dockerfile's `build` stage (not the final
-  # `runtime` stage `api`/`worker` use) — `build` still has the full `node_modules`, installed
-  # with `npm ci` (devDependencies included), so the `prisma` CLI is actually present there.
-  # `runtime` is intentionally minimal (`npm ci --omit=dev` in the `prod-deps` stage) and does
-  # NOT have the `prisma` CLI — only `@prisma/client`, which the running application needs but
-  # `migrate deploy` does not use. This keeps the existing minimal runtime image completely
-  # unchanged while still letting `docker compose up` alone reach a fully migrated, working
-  # system with no separate manual step (assignment: "docker compose up should start the
-  # required environment").
+  # One-off Prisma migration job; must complete successfully before api/worker start.
   migrate:
     build:
       context: ./backend
@@ -60,6 +51,8 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: '6379'
       PORT: '3000'
+      # Must be the browser-reachable frontend origin, not a Compose-internal hostname.
+      FRONTEND_ORIGIN: http://localhost:${FRONTEND_PORT:-3001}
     ports:
       - '${API_PORT:-3000}:3000'
     depends_on:
@@ -87,15 +80,7 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  # Minimal frontend demonstration (architecture.md §19/§20) — a static export served by
-  # nginx, its own image/container, no second backend Dockerfile involved. `NEXT_PUBLIC_*`
-  # variables are inlined into the JS bundle at BUILD time (Next.js's own convention — there
-  # is no server at runtime to read them from later), so the API URL is a build `arg`, not a
-  # runtime `environment` var. Deliberately `http://localhost:${API_PORT:-3000}`, never a
-  # Compose-internal service name like `http://api:3000`: this URL is fetched from the code
-  # running in the USER'S BROWSER, not from inside a container, and Compose service names are
-  # only resolvable between containers on the Compose network (see frontend/lib/api.ts's own
-  # comment for the full reasoning).
+  # Static Next.js export served by nginx; NEXT_PUBLIC_API_BASE_URL is baked in at build time.
   frontend:
     build:
       context: ./frontend
@@ -106,19 +91,6 @@ services:
       - '${FRONTEND_PORT:-3001}:80'
     depends_on:
       - api
-
-# Same backend image, built once (multi-stage Dockerfile from Phase 1), reused by `migrate`
-# (`build` stage), `api`, and `worker` (both `runtime` stage, the image's default final stage,
-# selected via a `command:` override) — architecture.md §20, no second Dockerfile for the
-# backend. `frontend` is a separate image built from its own Dockerfile (frontend/Dockerfile)
-# since it is a different application (static Next.js export + nginx), not a third mode of
-# the same backend image. `api` and `worker` both wait on `migrate` completing successfully
-# before starting, so neither ever queries a schema that isn't there yet; `frontend` only
-# waits on `api` existing (not health — the browser itself surfaces a clear error state if the
-# API isn't reachable yet, which is simpler than a Compose-level health gate for a static
-# file server that doesn't call the API itself). No password/ACL is configured on Redis — this
-# is a local-only development instance with no data worth protecting, matching Postgres's
-# equally simple local credentials above.
 
 volumes:
   postgres_data:
