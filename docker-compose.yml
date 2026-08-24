@@ -28,6 +28,48 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # One-off job, not a long-running service: applies pending Prisma migrations against
+  # `postgres`, then exits. Deliberately targets the Dockerfile's `build` stage (not the final
+  # `runtime` stage `api`/`worker` use) — `build` still has the full `node_modules`, installed
+  # with `npm ci` (devDependencies included), so the `prisma` CLI is actually present there.
+  # `runtime` is intentionally minimal (`npm ci --omit=dev` in the `prod-deps` stage) and does
+  # NOT have the `prisma` CLI — only `@prisma/client`, which the running application needs but
+  # `migrate deploy` does not use. This keeps the existing minimal runtime image completely
+  # unchanged while still letting `docker compose up` alone reach a fully migrated, working
+  # system with no separate manual step (assignment: "docker compose up should start the
+  # required environment").
+  migrate:
+    build:
+      context: ./backend
+      target: build
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    environment:
+      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ['node', 'dist/main.js']
+    environment:
+      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+      PORT: '3000'
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
   worker:
     build:
       context: ./backend
@@ -42,15 +84,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
-# Same backend image as the (not-yet-added) api service will use, run with a different
-# `command:` (architecture.md §20) — no second Dockerfile. No provider/retry configuration
-# here yet (this phase implements neither). Migrations are still applied manually against
-# Postgres for local development, exactly as in every prior phase; this service does not run
-# them itself, since no phase so far has wired that up (there is no `api` service in this
-# file yet either — see this phase's report for that observation). No password/ACL is
-# configured on Redis — this is a local-only development instance with no data worth
-# protecting, matching Postgres's equally simple local credentials above.
+# Same backend image, built once (multi-stage Dockerfile from Phase 1), reused by `migrate`
+# (`build` stage), `api`, and `worker` (both `runtime` stage, the image's default final stage,
+# selected via a `command:` override) — architecture.md §20, no second Dockerfile. `api` and
+# `worker` both wait on `migrate` completing successfully before starting, so neither ever
+# queries a schema that isn't there yet. `frontend` is not yet in this file — added in a later
+# phase, per architecture.md §20's own phased Compose rollout. No password/ACL is configured
+# on Redis — this is a local-only development instance with no data worth protecting, matching
+# Postgres's equally simple local credentials above.
 
 volumes:
   postgres_data:
