@@ -16,6 +16,14 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    # `prisma validate` only parses/checks prisma/schema.prisma — it never connects to a
+    # database — but Prisma still requires DATABASE_URL to be *present* in the environment
+    # (schema.prisma's `url = env("DATABASE_URL")` is resolved at load time), or it fails
+    # with P1012 "Environment variable not found". Same fixed, non-sensitive, test-only value
+    # the e2e job already uses; no Postgres service is started here since nothing in this job
+    # ever connects to it.
+    env:
+      DATABASE_URL: postgresql://payroll:payroll@localhost:5432/payroll?schema=public
     steps:
       - uses: actions/checkout@v4
 
