@@ -84,3 +84,27 @@ export const STALE_PROCESSING_SWEEP_INTERVAL_MS = 30 * 1000;
  * to protect against. No architecture/database-design document specifies this value.
  */
 export const ORDERING_DEFER_DELAY_MS = 500;
+
+/**
+ * Reconciliation design (architecture.md §15, database-design.md §14) — the DB-commit →
+ * queue-enqueue gap sweep. How old a `PENDING` event's `submitted_at` must be before it is
+ * considered an orphan candidate (no corresponding BullMQ job) rather than simply a
+ * just-submitted event whose normal, synchronous post-commit `enqueue()` call hasn't happened
+ * yet. database-design.md §18's own worked SQL example for this exact query uses `interval
+ * '5 minutes'` — adopted here as the approved concrete value (explicitly confirmed, not
+ * silently invented, since architecture.md itself only says "a short threshold" without a
+ * number). Deliberately much larger than `ORDERING_DEFER_DELAY_MS`/backoff-scale delays: this
+ * threshold exists purely to avoid racing the normal synchronous enqueue-after-commit path
+ * (architecture.md §17), not to bound anything time-sensitive.
+ */
+export const RECONCILIATION_AGE_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * Reconciliation design — how often the sweep re-runs after its initial on-startup pass
+ * (architecture.md §15: "run on worker startup and on a fixed interval"). No document
+ * specifies a number; explicitly approved as 60 seconds — comfortably under
+ * `RECONCILIATION_AGE_THRESHOLD_MS` so an orphaned event is caught promptly without polling
+ * excessively, and independent of `STALE_PROCESSING_SWEEP_INTERVAL_MS` above (a different
+ * sweep, for a different gap — see `ReconciliationSweepService`'s own doc comment).
+ */
+export const RECONCILIATION_SWEEP_INTERVAL_MS = 60 * 1000;

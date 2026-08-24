@@ -4,6 +4,7 @@ import { ProcessingModule } from './processing.module';
 import { EventProcessingService } from './event-processing.service';
 import { payrollEventsWorkerProvider } from './payroll-events-worker.provider';
 import { StaleProcessingSweepService } from './stale-processing-sweep.service';
+import { ReconciliationSweepService } from './reconciliation-sweep.service';
 import { PAYROLL_EVENTS_WORKER } from './processing.constants';
 import { PAYROLL_PROVIDER } from './payroll-provider';
 import { SimulatedPayrollProvider } from './simulated-payroll-provider';
@@ -30,6 +31,11 @@ import { SimulatedPayrollProvider } from './simulated-payroll-provider';
  * reason: crash recovery is exclusively a worker-side concern, and it needs
  * PayrollEventsQueueService (re-exported by ProcessingModule, already imported above) to
  * re-enqueue events it recovers — no second queue, no second connection.
+ *
+ * ReconciliationSweepService (reconciliation design, architecture.md §15) is registered here
+ * for the same reason as StaleProcessingSweepService: the DB-commit/enqueue-gap sweep is
+ * exclusively a worker-side concern (the API process must never run it), and it needs the
+ * same shared PayrollEventsQueueService — no second queue, no second connection.
  */
 @Module({
   imports: [ProcessingModule],
@@ -37,6 +43,7 @@ import { SimulatedPayrollProvider } from './simulated-payroll-provider';
     EventProcessingService,
     payrollEventsWorkerProvider,
     StaleProcessingSweepService,
+    ReconciliationSweepService,
     { provide: PAYROLL_PROVIDER, useClass: SimulatedPayrollProvider },
   ],
 })
