@@ -5,16 +5,26 @@ const STATUS_CLASS: Record<string, string> = {
   FAILED: 'badge-failed',
 };
 
-/** Color-coded status badge — the primary "make state changes obvious" affordance used on
- * both the list and detail pages. Falls back to the pending style for any unrecognized
- * status string rather than crashing (defensive against the backend evolving its status
- * set — the frontend never assumes it knows every possible value). */
-export function StatusBadge({ status }: { status: string }) {
+interface StatusBadgeProps {
+  status: string;
+  failureType?: string | null;
+}
+
+/**
+ * Color-coded status badge with animated pulse dot for active processing states.
+ * Safely falls back to pending style for unrecognized status values.
+ */
+export function StatusBadge({ status, failureType }: StatusBadgeProps) {
   const className = STATUS_CLASS[status] ?? 'badge-pending';
   return (
     <span className={`badge ${className}`}>
       <span className="badge-dot" aria-hidden="true" />
-      {status}
+      <span>{status}</span>
+      {status === 'FAILED' && failureType && (
+        <span style={{ opacity: 0.85, fontSize: '0.6875rem' }}>
+          ({failureType})
+        </span>
+      )}
     </span>
   );
 }
