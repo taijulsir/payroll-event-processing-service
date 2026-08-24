@@ -517,7 +517,8 @@ accepted trade-off, not an oversight.
 The provider is **simulated** — an in-process service, not a real integration (explicitly
 excluded by the assignment). It:
 
-- adds randomized latency, to make asynchronous behavior visibly real;
+- is fully deterministic — no simulated latency, no randomness
+  (`simulated-payroll-provider.ts`);
 - performs basic business validation on the event payload;
 - raises `TransientProviderError` at a configurable random rate (manual demoing) **and**
   supports deterministic failure injection via a reserved marker value (automated tests must
@@ -678,8 +679,12 @@ anywhere.
   Phase-1 `Dockerfile`); the database user used by the app should be scoped to only the schema
   it needs, not a superuser, when deployed beyond local Compose.
 - **CORS**: enabled, scoped to the frontend's origin.
-- **Authentication/rate limiting**: explicitly **not** implemented — out of scope per the
-  assignment ("What Is Not Required"), stated here plainly rather than left ambiguous.
+- **Authentication**: explicitly **not** implemented — out of scope per the assignment ("What
+  Is Not Required"), stated here plainly rather than left ambiguous.
+- **Rate limiting**: implemented on `POST /events` only (`@nestjs/throttler`, IP-based, 60
+  requests per rolling 60-second window) — abuse protection at the HTTP edge, unrelated to and
+  independent of the retry/backoff/ordering/reconciliation mechanisms described elsewhere in
+  this document. Not applied to `GET /events`, `GET /events/:id`, or `/health`.
 
 ## 24. Important Architectural Decisions
 

@@ -12,8 +12,10 @@ import {
   Post,
   Query,
   Res,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiHeader, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ThrottlerGuard } from '@nestjs/throttler';
 import type { Response } from 'express';
 import { validateEventPayload } from '../event-types/validate-event-payload';
 import { EventsService } from './events.service';
@@ -29,6 +31,11 @@ export class EventsController {
 
   @Post()
   @HttpCode(HttpStatus.ACCEPTED)
+  // Rate limiting, scoped to this route only (not GET /events, GET /events/:id, or /health) —
+  // see events.constants.ts (EVENTS_SUBMIT_RATE_LIMIT*) for the configured limit/window and its
+  // rationale. This is abuse protection at the HTTP edge, independent of and unrelated to the
+  // retry/backoff/ordering/reconciliation mechanisms further down the processing pipeline.
+  @UseGuards(ThrottlerGuard)
   @ApiOperation({
     summary: 'Submit a payroll event for asynchronous processing',
     description:
@@ -54,6 +61,10 @@ export class EventsController {
   @ApiResponse({
     status: 409,
     description: 'The Idempotency-Key was already used with a different request payload.',
+  })
+  @ApiResponse({
+    status: 429,
+    description: 'Too many requests — rate limit exceeded for this client.',
   })
   async create(
     @Headers('idempotency-key') idempotencyKey: string | undefined,
