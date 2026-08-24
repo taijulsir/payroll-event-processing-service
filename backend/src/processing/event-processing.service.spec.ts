@@ -140,7 +140,11 @@ describe('EventProcessingService', () => {
       payload: {},
     };
     const { prisma, updateMany, create } = buildFakePrisma(event);
-    const provider = buildFakeProvider({ outcome: 'FAILURE', failureReason: 'business rejection' });
+    const provider = buildFakeProvider({
+      outcome: 'FAILURE',
+      classification: 'PERMANENT',
+      failureReason: 'business rejection',
+    });
     const service = new EventProcessingService(prisma as never, provider);
 
     const result = await service.processEvent('e1');
@@ -174,12 +178,49 @@ describe('EventProcessingService', () => {
       payload: {},
     };
     const { prisma, updateMany } = buildFakePrisma(event);
-    const provider = buildFakeProvider({ outcome: 'FAILURE', failureReason: 'nope' });
+    const provider = buildFakeProvider({
+      outcome: 'FAILURE',
+      classification: 'PERMANENT',
+      failureReason: 'nope',
+    });
     const service = new EventProcessingService(prisma as never, provider);
 
     await service.processEvent('e1');
 
     const finalizeCall = updateMany.mock.calls[1][0];
     expect(finalizeCall.data.result).toBeUndefined();
+  });
+
+  it('R1: a TRANSIENT classification does not change lifecycle behavior — still finalizes straight to FAILED/PERMANENT (retry not implemented yet)', async () => {
+    const event = {
+      id: 'e1',
+      status: 'PENDING',
+      employeeId: 'emp-1',
+      eventType: 'ADDRESS_CHANGE',
+      payload: {},
+    };
+    const { prisma, updateMany, create } = buildFakePrisma(event);
+    const provider = buildFakeProvider({
+      outcome: 'FAILURE',
+      classification: 'TRANSIENT',
+      failureReason: 'temporary outage',
+    });
+    const service = new EventProcessingService(prisma as never, provider);
+
+    const result = await service.processEvent('e1');
+
+    // Exactly two updateMany calls total (claim + finalize) — no third call returning the
+    // event to PENDING, proving no retry transition exists in this phase.
+    expect(updateMany).toHaveBeenCalledTimes(2);
+    expect(updateMany).toHaveBeenNthCalledWith(2, {
+      where: { id: 'e1', status: 'PROCESSING' },
+      data: expect.objectContaining({
+        status: 'FAILED',
+        failureType: 'PERMANENT', // unconditional today, regardless of classification
+        failureReason: 'temporary outage',
+      }),
+    });
+    expect(create).toHaveBeenCalledTimes(2); // claim history + terminal FAILED history only
+    expect(result.outcome).toBe('failed');
   });
 });

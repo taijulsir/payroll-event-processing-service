@@ -7,7 +7,7 @@ import type {
 
 /**
  * Reserved substring: if present anywhere in `employeeId`, the provider deterministically
- * returns FAILURE; otherwise it deterministically returns SUCCESS.
+ * returns a PERMANENT FAILURE; otherwise it deterministically returns SUCCESS.
  *
  * Why this mechanism (documented per this phase's explicit instruction): tests must be able
  * to force a specific outcome without relying on randomness (architecture.md §16/§18 both
@@ -22,6 +22,15 @@ import type {
 export const FORCE_PROVIDER_FAILURE_MARKER = 'FORCE_PROVIDER_FAILURE';
 
 /**
+ * Reserved substring for a deterministic TRANSIENT failure (retry/backoff design phase R1).
+ * Kept distinct from FORCE_PROVIDER_FAILURE_MARKER (neither is a substring of the other) so
+ * the two are unambiguous to match against. Retry itself is not implemented yet — this marker
+ * only lets tests deterministically obtain a `classification: 'TRANSIENT'` outcome; nothing
+ * in this provider schedules, delays, or retries anything.
+ */
+export const FORCE_PROVIDER_TRANSIENT_FAILURE_MARKER = 'FORCE_PROVIDER_TRANSIENT_FAILURE';
+
+/**
  * The simulated external payroll provider (architecture.md §16). Deterministic — no
  * `Math.random()`, no network calls — so it is safe for automated tests and unit-testable in
  * isolation. Does not add artificial latency: nothing in this phase's scope calls for it, and
@@ -30,9 +39,18 @@ export const FORCE_PROVIDER_FAILURE_MARKER = 'FORCE_PROVIDER_FAILURE';
 @Injectable()
 export class SimulatedPayrollProvider implements PayrollProvider {
   async apply(input: PayrollProviderInput): Promise<PayrollProviderOutcome> {
+    if (input.employeeId.includes(FORCE_PROVIDER_TRANSIENT_FAILURE_MARKER)) {
+      return {
+        outcome: 'FAILURE',
+        classification: 'TRANSIENT',
+        failureReason: `Simulated payroll provider reported a transient failure for event ${input.eventId}, employeeId '${input.employeeId}' (deterministic test marker matched).`,
+      };
+    }
+
     if (input.employeeId.includes(FORCE_PROVIDER_FAILURE_MARKER)) {
       return {
         outcome: 'FAILURE',
+        classification: 'PERMANENT',
         failureReason: `Simulated payroll provider rejected event ${input.eventId} for employeeId '${input.employeeId}' (deterministic test marker matched).`,
       };
     }

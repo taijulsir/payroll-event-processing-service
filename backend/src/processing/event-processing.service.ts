@@ -177,7 +177,16 @@ export class EventProcessingService {
       return this.finalizeSuccess(event.id, outcome.result);
     }
 
-    this.logger.warn(`provider failed: eventId=${event.id} reason=${outcome.failureReason}`);
+    // R1 (retry/backoff design, Phase R1 — provider failure classification): the provider
+    // now reports `outcome.classification` ('TRANSIENT' | 'PERMANENT'), but this phase is
+    // scoped to that classification existing and being deterministic, not to acting on it.
+    // Every failure — regardless of classification — is still finalized straight to
+    // FAILED/PERMANENT below, exactly as before this field existed. Reacting differently to
+    // 'TRANSIENT' (returning to PENDING, checking attempts against maxAttempts, etc.) is R2's
+    // job, not this one's.
+    this.logger.warn(
+      `provider failed: eventId=${event.id} classification=${outcome.classification} reason=${outcome.failureReason}`,
+    );
     return this.finalizeFailure(event.id, outcome.failureReason);
   }
 
