@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payroll
+      POSTGRES_PASSWORD: payroll
+      POSTGRES_DB: payroll
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U payroll -d payroll']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-off Prisma migration job; must complete successfully before api/worker start.
+  migrate:
+    build:
+      context: ./backend
+      target: build
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    environment:
+      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ['node', 'dist/main.js']
+    environment:
+      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+      PORT: '3000'
+      # Must be the browser-reachable frontend origin, not a Compose-internal hostname.
+      FRONTEND_ORIGIN: http://localhost:${FRONTEND_PORT:-3001}
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ['node', 'dist/worker.js']
+    environment:
+      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Static Next.js export served by nginx; NEXT_PUBLIC_API_BASE_URL is baked in at build time.
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:${API_PORT:-3000}
+    restart: unless-stopped
+    ports:
+      - '${FRONTEND_PORT:-3001}:80'
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:

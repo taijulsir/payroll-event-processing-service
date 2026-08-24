@@ -1,0 +1,157 @@
+// Prisma schema for the Payroll Event Processing Service.
+//
+// This file MUST match docs/database-design.md exactly. It contains only the two
+// approved entities (payroll_events, event_status_history) — no Employee model, no
+// queue-state tracking, no additional fields. Consult docs/database-design.md before
+// changing anything here; any structural change must first go through the review
+// docs/architecture.md §27 requires.
+//
+// Native PostgreSQL ENUMs are deliberately not used for `event_type` or `status` — both
+// are plain varchar, validated at the application layer, per the approved architecture
+// (architecture.md §7, database-design.md §4/§7/§16). This keeps adding a new event type,
+// or revising the state machine, a migration-light change.
+//
+// Constraints Prisma cannot express declaratively (CHECK constraints on `failure_type`,
+// `attempts`, `max_attempts`, `sequence`) are added as raw SQL appended to the initial
+// migration — see prisma/migrations/<timestamp>_init/migration.sql. They are NOT
+// represented here because Prisma's schema language has no CHECK-constraint syntax; this
+// is a known, accepted limitation, not an oversight. No CHECK constraint is added for
+// `status` or `event_type` — that was deliberately reviewed and rejected, see
+// docs/database-design.md §7.
+//
+// PostgreSQL advisory locking (pg_advisory_xact_lock, keyed on a hash of employeeId) is
+// REQUIRED for correct `sequence` allocation but is intentionally NOT modeled here — it is
+// not a schema-level construct Prisma can express, and its use belongs to the event
+// submission implementation phase (raw SQL via $queryRaw/$executeRaw inside the
+// submission transaction). Full rationale: docs/database-design.md §9,
+// docs/architecture.md §7/§12.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// One row per submitted payroll event: identity, business data, per-employee ordering
+/// position, current lifecycle state, and outcome. See docs/database-design.md §4.
+model PayrollEvent {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Opaque external employee identifier — NOT a foreign key. There is deliberately no
+  /// Employee model/table (architecture.md §7/§25, database-design.md §6/§20).
+  employeeId String @map("employee_id") @db.VarChar
+
+  /// e.g. BANK_ACCOUNT_CHANGE / ADDRESS_CHANGE / SALARY_CHANGE. Plain varchar, no CHECK,
+  /// no native enum — see file header and database-design.md §4/§7.
+  eventType String @map("event_type") @db.VarChar
+
+  /// This event's position in submission order for this employee. Allocated under a
+  /// PostgreSQL advisory lock at insert time — see file header and database-design.md §9.
+  sequence BigInt
+
+  /// Client-supplied key identifying one logical submission attempt. The @unique below is
+  /// the entire idempotency enforcement mechanism (database-design.md §10).
+  idempotencyKey String @unique @map("idempotency_key") @db.VarChar
+
+  /// Event-type-specific business fields (IBAN, address, salary/currency, effectiveDate).
+  /// jsonb, not per-type columns/tables, so a new event type is a data/handler-only change
+  /// (database-design.md §4/§19).
+  payload Json
+
+  /// One of PENDING | PROCESSING | SUCCEEDED | FAILED (database-design.md §11). Plain
+  /// varchar, no CHECK — see file header.
+  status String @default("PENDING") @db.VarChar
+
+  attempts Int @default(0)
+
+  /// Attempt budget for this event. No DB-level default: the application supplies it from
+  /// config on every insert (the concrete number/backoff curve is an explicit Phase 5
+  /// implementation detail per architecture.md §13 — not invented here).
+  maxAttempts Int @map("max_attempts")
+
+  /// Simulated provider's success payload. Set only once status = SUCCEEDED.
+  result Json?
+
+  /// Human-readable failure explanation. Set only once status = FAILED.
+  failureReason String? @map("failure_reason")
+
+  /// RETRYABLE (retries exhausted) or PERMANENT (non-retryable rejection). Set only once
+  /// status = FAILED. The correlation with `status` is application-enforced, not a DB
+  /// constraint (database-design.md §7).
+  failureType String? @map("failure_type") @db.VarChar
+
+  submittedAt          DateTime  @default(now()) @map("submitted_at") @db.Timestamptz(6)
+  processingStartedAt  DateTime? @map("processing_started_at") @db.Timestamptz(6)
+  processingFinishedAt DateTime? @map("processing_finished_at") @db.Timestamptz(6)
+
+  /// DB-defaulted to now() at insert time (database-design.md §4); refreshed explicitly by
+  /// application code on every subsequent write — deliberately not a database trigger, and
+  /// not Prisma's `@updatedAt` auto-behavior, since future CAS updates (architecture.md
+  /// §11) are expected to use guarded raw SQL rather than exclusively Prisma's fluent
+  /// update() API, and the documented behavior must hold regardless of which write path is
+  /// used.
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  statusHistory EventStatusHistory[]
+
+  // UNIQUE(employee_id, sequence) — the final, unconditional invariant that no employee
+  // can ever hold a duplicate sequence value, independent of the advisory lock's own
+  // correctness. See database-design.md §7/§9.
+  @@unique([employeeId, sequence], map: "payroll_events_employee_id_sequence_key")
+  // Reconciliation sweep (WHERE status='PENDING' AND submitted_at < :threshold) and
+  // general status-filtered listing. See database-design.md §8/§14.
+  @@index([status, submittedAt], map: "payroll_events_status_submitted_at_idx")
+  // Stale-processing recovery sweep (retry/backoff design, R4 — WHERE status='PROCESSING'
+  // AND processing_started_at < :threshold). A DIFFERENT sweep from the one above: that one
+  // finds PENDING events with no BullMQ job (the submit/enqueue gap, architecture.md §15);
+  // this one finds PROCESSING events whose worker appears to have crashed or stalled
+  // (architecture.md §14's "crash during processing" scenario). Reusing the (status,
+  // submittedAt) index above would not serve this query — submittedAt is unrelated to how
+  // long an event has been PROCESSING.
+  @@index([status, processingStartedAt], map: "payroll_events_status_processing_started_at_idx")
+  @@map("payroll_events")
+}
+
+/// Append-only audit trail: one row per state transition a PayrollEvent goes through.
+/// Rows are only ever inserted, never updated or deleted. See docs/database-design.md §5.
+model EventStatusHistory {
+  id String @id @default(uuid()) @db.Uuid
+
+  eventId String @map("event_id") @db.Uuid
+
+  /// NULL only for the very first row of an event's history (creation into PENDING has no
+  /// "from" state).
+  fromStatus String? @map("from_status") @db.VarChar
+
+  toStatus String @map("to_status") @db.VarChar
+
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  /// NULL for the initial creation row (no attempt has started yet).
+  attemptNumber Int? @map("attempt_number")
+
+  /// Populated for transitions into PENDING (retry) or FAILED (terminal failure).
+  errorMessage String? @map("error_message")
+
+  /// Small, open-ended field for anything else worth recording about a transition (e.g.
+  /// which worker instance performed it). Not required by the assignment; costs nothing
+  /// structurally. See database-design.md §5.
+  metadata Json?
+
+  // onDelete/onUpdate explicitly set to NoAction (Postgres's NO ACTION — no clause emitted
+  // beyond that) rather than left unset, because Prisma's own unset-relation default emits
+  // an explicit ON DELETE RESTRICT ON UPDATE CASCADE, which is NOT what was approved.
+  // Deleting a PayrollEvent row that still has history is rejected, not cascaded — CASCADE
+  // would silently destroy audit data, which is the opposite of what an audit trail is
+  // for. See database-design.md §6/§7/§19 for the full rationale.
+  event PayrollEvent @relation(fields: [eventId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  // Retrieving one event's full history in chronological order. Postgres does not
+  // auto-index the referencing side of a foreign key, so this is required, not optional.
+  // See database-design.md §8.
+  @@index([eventId, occurredAt], map: "event_status_history_event_id_occurred_at_idx")
+  @@map("event_status_history")
+}

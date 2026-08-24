@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, development]
+  push:
+    branches: [main, development]
+
+jobs:
+  # Lint, typecheck, build, Prisma schema validation, and unit tests — none of these need
+  # Postgres/Redis, so they all run as sequential steps in one job (architecture.md §21,
+  # stages 1-4): one checkout/install pays for all four checks, and the job fails fast on the
+  # first broken step.
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    # `prisma validate` only parses/checks prisma/schema.prisma — it never connects to a
+    # database — but Prisma still requires DATABASE_URL to be *present* in the environment
+    # (schema.prisma's `url = env("DATABASE_URL")` is resolved at load time), or it fails
+    # with P1012 "Environment variable not found". Same fixed, non-sensitive, test-only value
+    # the e2e job already uses; no Postgres service is started here since nothing in this job
+    # ever connects to it.
+    env:
+      DATABASE_URL: postgresql://payroll:payroll@localhost:5432/payroll?schema=public
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - run: npm run prisma:validate
+
+      - run: npm test
+
+  # Integration/e2e tests against real Postgres + Redis (architecture.md §21, stage 5) —
+  # GitHub Actions service containers, not docker compose: lighter weight than standing up the
+  # full Compose topology, and this is the same real-infrastructure coverage the docker-build
+  # job's plain image build does not exercise.
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: payroll
+          POSTGRES_PASSWORD: payroll
+          POSTGRES_DB: payroll
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payroll -d payroll"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://payroll:payroll@localhost:5432/payroll?schema=public
+      REDIS_HOST: localhost
+      REDIS_PORT: '6379'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      # prisma migrate deploy — never `migrate dev`/`migrate reset` (non-interactive,
+      # applies existing migrations only, exactly what a CI database needs).
+      - run: npx prisma migrate deploy
+
+      - run: npm run test:e2e
+
+  # Frontend checks (Next.js 16 + TypeScript, static export, its own package.json/lockfile) —
+  # independent of the backend job above: no shared dependencies, no reason for one to gate
+  # the other's fast checks. Deliberately its own job rather than folded into `verify`: two
+  # unrelated lockfiles/toolchains in one job would need two separate `npm ci` runs anyway,
+  # and a dedicated job name makes a frontend-only failure unambiguous at a glance. No lint
+  # step and no test framework — the frontend has neither (see frontend/package.json); `tsc
+  # --noEmit` is this project's correctness gate for it, matching what was actually built.
+  frontend-verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+  # Docker build validation (architecture.md §21, stage 6) for both images this repo builds.
+  # A single `docker build` with no --target defaults to the backend Dockerfile's final
+  # `runtime` stage, which transitively builds deps -> build -> prod-deps -> runtime — this
+  # already validates every stage, including the `build` stage the docker-compose.yml
+  # `migrate` service targets, in one invocation. The frontend build is a separate image
+  # (frontend/Dockerfile: static Next.js export served by nginx) — gated on `frontend-verify`
+  # passing first, same as the backend image is gated on `verify`. No `docker compose up` for
+  # either: the e2e job above already proves the backend works against real Postgres/Redis,
+  # and a full Compose smoke test here would only duplicate that coverage more slowly.
+  docker-build:
+    needs: [verify, frontend-verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: docker build ./backend
+
+      - run: docker build ./frontend
