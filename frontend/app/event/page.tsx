@@ -100,7 +100,7 @@ function EventDetailContent() {
           Invalid Request
         </p>
         <p className="state-box__desc">No event identifier was provided in query parameters.</p>
-        <Link href="/" className="btn btn-secondary">
+        <Link href="/events/" className="btn btn-secondary">
           ← Back to Events
         </Link>
       </div>
@@ -114,7 +114,7 @@ function EventDetailContent() {
           Event Not Found
         </p>
         <p className="state-box__desc">No payroll event was found matching ID: {id}</p>
-        <Link href="/" className="btn btn-secondary">
+        <Link href="/events/" className="btn btn-secondary">
           ← Back to Events
         </Link>
       </div>
@@ -132,7 +132,7 @@ function EventDetailContent() {
           <button type="button" className="btn btn-primary btn-sm" onClick={resumePolling}>
             Retry Request
           </button>
-          <Link href="/" className="btn btn-secondary btn-sm">
+          <Link href="/events/" className="btn btn-secondary btn-sm">
             Back to Events
           </Link>
         </div>
@@ -177,8 +177,8 @@ function EventDetailContent() {
           </div>
         </div>
         <div className="page-header__actions">
-          <Link href="/" className="btn btn-secondary btn-sm">
-            ← Back to Stream
+          <Link href="/events/" className="btn btn-secondary btn-sm">
+            ← Back to Events
           </Link>
         </div>
       </div>
