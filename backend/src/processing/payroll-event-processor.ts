@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
-import { Job } from 'bullmq';
+import { DelayedError, Job } from 'bullmq';
 import { EventProcessingService } from './event-processing.service';
+import { ORDERING_DEFER_DELAY_MS } from './processing.constants';
 
 /**
  * The BullMQ-facing adapter: translates a raw `Job` into a call to `EventProcessingService`.
@@ -17,7 +18,13 @@ import { EventProcessingService } from './event-processing.service';
 export function createPayrollEventProcessor(eventProcessingService: EventProcessingService) {
   const logger = new Logger('PayrollEventProcessor');
 
-  return async function processPayrollEventJob(job: Job<{ eventId?: unknown }>): Promise<void> {
+  // `token` is BullMQ's second argument to a Processor function (verified against the
+  // installed 6.2.0 API: `Processor = (job, token?, signal?) => Promise<R>`) — the lock
+  // token for this job, required by `job.moveToDelayed(timestamp, token)` below.
+  return async function processPayrollEventJob(
+    job: Job<{ eventId?: unknown }>,
+    token?: string,
+  ): Promise<void> {
     logger.log(`job received: jobId=${job.id}`);
 
     const eventId = job.data?.eventId;
@@ -52,6 +59,23 @@ export function createPayrollEventProcessor(eventProcessingService: EventProcess
     if (result.outcome === 'retry-scheduled') {
       logger.warn(`job will be retried by BullMQ: jobId=${job.id} eventId=${eventId}`);
       throw new Error(`event ${eventId} scheduled for retry (transient provider failure)`);
+    }
+
+    // Per-employee ordering (architecture.md §12): the event was NOT claimed — an earlier,
+    // non-terminal sibling exists for this employee. This is a scheduling wait, not a
+    // processing failure: `job.moveToDelayed()` + throwing `DelayedError` (verified against
+    // the installed BullMQ 6.2.0 source — worker.js's handleFailed special-cases
+    // `err instanceof DelayedError`/`err.name === 'DelayedError'` and returns via
+    // `moveToActive()` WITHOUT ever calling `job.moveToFailed()`, the only place
+    // `attemptsMade` is incremented, and WITHOUT emitting `'failed'`) is BullMQ's own
+    // documented mechanism for a processor to voluntarily postpone a job without consuming
+    // any attempt budget or triggering the R3 backstop. `DelayedError` must never be caught
+    // and converted into a normal success/failure here or anywhere else — it must propagate
+    // exactly as thrown.
+    if (result.outcome === 'ordering-blocked') {
+      logger.log(`job deferred (per-employee ordering): jobId=${job.id} eventId=${eventId}`);
+      await job.moveToDelayed(Date.now() + ORDERING_DEFER_DELAY_MS, token);
+      throw new DelayedError();
     }
   };
 }

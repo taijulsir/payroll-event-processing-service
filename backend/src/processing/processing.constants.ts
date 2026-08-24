@@ -72,3 +72,15 @@ export const STALE_PROCESSING_TIMEOUT_MS = 2 * 60 * 1000;
  * revisited if that trade-off (recovery latency vs. sweep frequency) needs tuning.
  */
 export const STALE_PROCESSING_SWEEP_INTERVAL_MS = 30 * 1000;
+
+/**
+ * Per-employee ordering design — approved decision: the fixed delay used when a job is
+ * deferred because an earlier, non-terminal sibling event exists for the same employee
+ * (architecture.md §12). This is NOT retry/backoff (PAYROLL_EVENTS_JOB_BACKOFF_BASE_DELAY_MS
+ * above) — an ordering wait is not a processing failure, has no attempt budget to protect,
+ * and therefore uses a short, fixed delay rather than an exponential curve: the wait is
+ * expected to resolve quickly once the predecessor finishes, and the predecessor's own
+ * lifecycle is already time-bounded by R2/R3/R4, so there is nothing here for backoff growth
+ * to protect against. No architecture/database-design document specifies this value.
+ */
+export const ORDERING_DEFER_DELAY_MS = 500;
