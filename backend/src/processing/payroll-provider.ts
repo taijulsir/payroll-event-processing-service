@@ -20,6 +20,15 @@ export interface PayrollProviderSuccess {
 
 export interface PayrollProviderFailure {
   outcome: 'FAILURE';
+  /**
+   * Whether this failure is worth retrying (architecture.md §13's two-code-path split:
+   * `TransientProviderError` vs `PermanentProviderError`). This is the provider's own
+   * classification of the failure it just produced — it does not, by itself, cause any
+   * retry to happen. Retry/backoff and finalize (a later, dedicated increment) is what
+   * actually acts on this value; as of this phase, every failure — regardless of this
+   * field — is still finalized to FAILED/PERMANENT (see event-processing.service.ts).
+   */
+  classification: 'TRANSIENT' | 'PERMANENT';
   /** Persisted into `payroll_events.failure_reason` (database-design.md §4). */
   failureReason: string;
 }

@@ -39,4 +39,26 @@ describe('createPayrollEventProcessor', () => {
 
     await expect(processor(buildJob({ eventId: 'event-123' }))).rejects.toThrow('db exploded');
   });
+
+  it('R2: throws when processEvent reports retry-scheduled, so BullMQ redelivers via its own attempts/backoff', async () => {
+    const processEvent = jest.fn().mockResolvedValue({ outcome: 'retry-scheduled' });
+    const service = { processEvent } as unknown as EventProcessingService;
+    const processor = createPayrollEventProcessor(service);
+
+    await expect(processor(buildJob({ eventId: 'event-123' }))).rejects.toThrow(
+      /scheduled for retry/,
+    );
+    expect(processEvent).toHaveBeenCalledWith('event-123');
+  });
+
+  it.each(['succeeded', 'failed', 'terminal', 'already-processing', 'lost-race', 'missing'])(
+    'does not throw for the non-retry outcome %s',
+    async (outcome) => {
+      const processEvent = jest.fn().mockResolvedValue({ outcome });
+      const service = { processEvent } as unknown as EventProcessingService;
+      const processor = createPayrollEventProcessor(service);
+
+      await expect(processor(buildJob({ eventId: 'event-123' }))).resolves.toBeUndefined();
+    },
+  );
 });
