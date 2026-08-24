@@ -357,4 +357,76 @@ export class EventProcessingService {
       return { outcome: 'failed' as const, event: updated };
     });
   }
+
+  /**
+   * Backstop reconciliation (retry/backoff design, R3). Called ONLY by the BullMQ `failed`
+   * event listener (payroll-event-failed-backstop.ts), and ONLY when BullMQ itself has
+   * already determined the job is exhausted (`job.attemptsMade >= job.opts.attempts`) — this
+   * is NOT the primary exhaustion mechanism. `runProviderAndFinalize`'s own
+   * attempts-vs-maxAttempts check (R2) already finalizes the normal case, and does so
+   * *before* the processor ever throws, so BullMQ's `failed` event does not even fire for a
+   * normal R2 exhaustion (the processor returns without throwing). This method exists only
+   * for the residual gap where BullMQ considers a job exhausted but the normal processor
+   * path never persisted a terminal state — e.g. an unexpected error after the claim
+   * committed but before `runProviderAndFinalize` could finish. It is deliberately named
+   * "reconcile", not "sweep" — this is a single, event-driven, per-job check triggered by one
+   * BullMQ `failed` event, not the periodic, all-`PENDING`-rows reconciliation *sweep*
+   * architecture.md §15 describes for the DB-commit/enqueue gap; the two are unrelated
+   * mechanisms for unrelated problems and must not be conflated.
+   *
+   * Idempotent and safe regardless of the event's actual current state:
+   *   - missing / SUCCEEDED / FAILED: no-op, returns `false` — nothing to reconcile.
+   *   - `PENDING`: no-op, returns `false` — see below for why this is correct, not overlooked.
+   *   - `PROCESSING`: the one case this backstop actually acts on — finalizes to
+   *     `FAILED`/`RETRYABLE` via the same guarded CAS + atomic history insert as every other
+   *     worker-side transition (`finalizeFailure`, reused as-is).
+   *
+   * Why `PENDING` is a no-op, not forced to `FAILED`: in this system's design, an event only
+   * returns to `PENDING` via `retryTransition`, which commits *before* the processor throws
+   * — so by the time BullMQ's `failed` event fires for that delivery, the DB has already
+   * moved on from `PROCESSING`. If this backstop finds the event `PENDING`, that is either
+   * (a) the normal, expected R2 case — the event is legitimately waiting for its next
+   * BullMQ-scheduled retry — or (b) something else has already reclaimed it. Neither case is
+   * safe to force to `FAILED`: doing so could terminate an event that still has a
+   * legitimately scheduled retry coming, or race with a concurrent claim. Doing nothing is
+   * the correct, safe choice here, not an oversight.
+   *
+   * Does not increment or otherwise touch `attempts` — that column's meaning (successful
+   * `PENDING -> PROCESSING` claims) is unchanged by this method, and BullMQ's own
+   * `attemptsMade` is never written into it (retry/backoff design's explicit constraint).
+   *
+   * @returns `true` if this call actually finalized the event, `false` if it found nothing
+   * to reconcile (including losing a race, which is exactly as safe as any other CAS miss).
+   */
+  async reconcileExhaustedJob(eventId: string): Promise<boolean> {
+    const event = await this.prisma.payrollEvent.findUnique({ where: { id: eventId } });
+
+    if (!event) {
+      this.logger.warn(`backstop: event not found, nothing to reconcile: eventId=${eventId}`);
+      return false;
+    }
+
+    if (event.status !== 'PROCESSING') {
+      this.logger.log(
+        `backstop: event is ${event.status}, not PROCESSING — no reconciliation needed: eventId=${eventId}`,
+      );
+      return false;
+    }
+
+    const result = await this.finalizeFailure(
+      eventId,
+      'Processing exhausted its retry budget at the queue layer without the worker persisting a terminal state.',
+      'RETRYABLE',
+    );
+
+    if (result.outcome === 'lost-race') {
+      this.logger.log(
+        `backstop: CAS lost, event already left PROCESSING by another writer: eventId=${eventId}`,
+      );
+      return false;
+    }
+
+    this.logger.warn(`backstop: finalized event as FAILED/RETRYABLE: eventId=${eventId}`);
+    return true;
+  }
 }

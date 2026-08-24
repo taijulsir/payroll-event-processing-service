@@ -360,4 +360,107 @@ describe('EventProcessingService', () => {
       expect(result).toEqual({ outcome: 'lost-race' });
     });
   });
+
+  describe('R3: reconcileExhaustedJob (BullMQ failed-event backstop)', () => {
+    const buildService = (event: Record<string, unknown> | null) => {
+      const fake = buildFakePrisma(event);
+      // reconcileExhaustedJob never calls the provider — pass a provider that would fail the
+      // test loudly if it were ever invoked, to prove that structurally.
+      const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
+      const service = new EventProcessingService(fake.prisma as never, provider);
+      return { ...fake, provider, service };
+    };
+
+    it('is a no-op when the event does not exist', async () => {
+      const { service, prisma, provider } = buildService(null);
+
+      const reconciled = await service.reconcileExhaustedJob('missing-id');
+
+      expect(reconciled).toBe(false);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(provider.apply).not.toHaveBeenCalled();
+    });
+
+    it.each(['SUCCEEDED', 'FAILED'])('is a no-op when the event is already %s', async (status) => {
+      const { service, prisma, provider } = buildService({ id: 'e1', status });
+
+      const reconciled = await service.reconcileExhaustedJob('e1');
+
+      expect(reconciled).toBe(false);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(provider.apply).not.toHaveBeenCalled();
+    });
+
+    it('is a no-op when the event is PENDING (legitimately awaiting its own scheduled retry, or already reclaimed)', async () => {
+      const { service, prisma, provider } = buildService({ id: 'e1', status: 'PENDING' });
+
+      const reconciled = await service.reconcileExhaustedJob('e1');
+
+      expect(reconciled).toBe(false);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(provider.apply).not.toHaveBeenCalled();
+    });
+
+    it('finalizes a PROCESSING event to FAILED/RETRYABLE, with one history row, and never touches attempts', async () => {
+      const { service, updateMany, create } = buildService({
+        id: 'e1',
+        status: 'PROCESSING',
+        attempts: 5,
+        maxAttempts: 5,
+      });
+
+      const reconciled = await service.reconcileExhaustedJob('e1');
+
+      expect(reconciled).toBe(true);
+      expect(updateMany).toHaveBeenCalledTimes(1);
+      const call = updateMany.mock.calls[0][0];
+      expect(call).toEqual({
+        where: { id: 'e1', status: 'PROCESSING' },
+        data: expect.objectContaining({ status: 'FAILED', failureType: 'RETRYABLE' }),
+      });
+      expect(call.data.attempts).toBeUndefined(); // never touched by the backstop
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventId: 'e1',
+          fromStatus: 'PROCESSING',
+          toStatus: 'FAILED',
+          attemptNumber: 5,
+        }),
+      });
+    });
+
+    it('returns false (no-op) if the finalize CAS loses the race', async () => {
+      const { service, updateMany } = buildService({ id: 'e1', status: 'PROCESSING' });
+      updateMany.mockResolvedValueOnce({ count: 0 });
+
+      const reconciled = await service.reconcileExhaustedJob('e1');
+
+      expect(reconciled).toBe(false);
+    });
+
+    it('is idempotent: calling it twice in a row only finalizes once', async () => {
+      const event = { id: 'e1', status: 'PROCESSING', attempts: 5, maxAttempts: 5 };
+      const { prisma, updateMany, create } = buildFakePrisma(event);
+      // After the first call finalizes, simulate the event now being FAILED for the second call.
+      const findUnique = jest
+        .fn()
+        .mockResolvedValueOnce(event)
+        .mockResolvedValueOnce({
+          ...event,
+          status: 'FAILED',
+        });
+      (prisma.payrollEvent as { findUnique: typeof findUnique }).findUnique = findUnique;
+      const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
+      const service = new EventProcessingService(prisma as never, provider);
+
+      const first = await service.reconcileExhaustedJob('e1');
+      const second = await service.reconcileExhaustedJob('e1');
+
+      expect(first).toBe(true);
+      expect(second).toBe(false);
+      expect(updateMany).toHaveBeenCalledTimes(1);
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+  });
 });

@@ -2,6 +2,7 @@ import { Logger, Provider } from '@nestjs/common';
 import { Worker } from 'bullmq';
 import type Redis from 'ioredis';
 import { createPayrollEventProcessor } from './payroll-event-processor';
+import { createFailedJobBackstopHandler } from './payroll-event-failed-backstop';
 import { EventProcessingService } from './event-processing.service';
 import {
   PAYROLL_EVENTS_QUEUE_NAME,
@@ -36,6 +37,11 @@ export const payrollEventsWorkerProvider: Provider = {
     worker.on('failed', (job, err) => {
       logger.error(`job failed: jobId=${job?.id} eventId=${job?.data?.eventId}: ${err.message}`);
     });
+    // Retry/backoff design, R3: a second, independent 'failed' listener — BullMQ supports
+    // multiple listeners per event, so this does not replace or interfere with the log-only
+    // listener directly above. See payroll-event-failed-backstop.ts for what this does and,
+    // just as importantly, does not do (it is a backstop, not the primary exhaustion path).
+    worker.on('failed', createFailedJobBackstopHandler(eventProcessingService));
     worker.on('completed', (job) => {
       logger.log(`job completed: jobId=${job.id} eventId=${job.data?.eventId}`);
     });
