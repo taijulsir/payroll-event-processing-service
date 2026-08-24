@@ -25,3 +25,29 @@ export const PAYROLL_EVENTS_QUEUE = Symbol('PAYROLL_EVENTS_QUEUE');
  * AppModule — so the API process never constructs a Worker and never starts consuming jobs.
  */
 export const PAYROLL_EVENTS_WORKER = Symbol('PAYROLL_EVENTS_WORKER');
+
+/**
+ * BullMQ's own delivery-retry budget for `payroll-events` jobs (retry/backoff design, R2 —
+ * approved decision: maxAttempts = 5). This is BullMQ's "how many times may this job be
+ * delivered" counter (`job.opts.attempts` / `job.attemptsMade`), set once as a queue-wide
+ * default via `payrollEventsQueueProvider`.
+ *
+ * It is deliberately the SAME number as `events.constants.ts`'s `DEFAULT_MAX_ATTEMPTS` today,
+ * but the two are NOT the same field and are not guaranteed to stay in lockstep: this constant
+ * bounds how many times BullMQ will ever hand this job to a processor; `payroll_events.attempts`
+ * (compared against `payroll_events.max_attempts`, a per-event Postgres column) is what
+ * `EventProcessingService` actually uses to decide whether a transient failure gets retried or
+ * finalized — that decision is made BEFORE BullMQ's own budget would ever matter, so under
+ * normal operation this queue-level limit is a backstop, never the primary decision-maker. See
+ * event-processing.service.ts for the full explanation, including the crash/divergence case
+ * where these two counters could disagree.
+ */
+export const PAYROLL_EVENTS_JOB_ATTEMPTS = 5;
+
+/**
+ * Base delay (ms) for BullMQ's exponential backoff between `payroll-events` redeliveries
+ * (retry/backoff design, R2 — approved decision: 2 second base delay). Applied via
+ * `payrollEventsQueueProvider`'s `defaultJobOptions.backoff`. No jitter — not required by the
+ * approved design, and this assignment's scale has no thundering-herd scenario to justify it.
+ */
+export const PAYROLL_EVENTS_JOB_BACKOFF_BASE_DELAY_MS = 2000;

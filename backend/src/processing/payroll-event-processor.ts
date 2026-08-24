@@ -31,14 +31,27 @@ export function createPayrollEventProcessor(eventProcessingService: EventProcess
       throw new Error(`malformed job ${job.id}: missing or invalid eventId`);
     }
 
+    let result;
     try {
-      await eventProcessingService.processEvent(eventId);
+      result = await eventProcessingService.processEvent(eventId);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error(
         `unexpected error processing job: jobId=${job.id} eventId=${eventId}: ${message}`,
       );
       throw err; // let BullMQ mark this job failed; the worker process itself is unaffected.
+    }
+
+    // Retry/backoff design, R2: EventProcessingService has already committed the
+    // PROCESSING -> PENDING retry transition (its own, separate transaction) by this point —
+    // throwing here does not risk any inconsistent database state, it only tells BullMQ "this
+    // delivery didn't finish, please redeliver." Retry scheduling itself (the backoff delay,
+    // the redelivery, the delivery-count budget) is entirely BullMQ's own job, configured via
+    // the queue's defaultJobOptions (payroll-events-queue.provider.ts) — this is the one place
+    // that translates our outcome model into BullMQ's own throw-to-retry mechanism.
+    if (result.outcome === 'retry-scheduled') {
+      logger.warn(`job will be retried by BullMQ: jobId=${job.id} eventId=${eventId}`);
+      throw new Error(`event ${eventId} scheduled for retry (transient provider failure)`);
     }
   };
 }

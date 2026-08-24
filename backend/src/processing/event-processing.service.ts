@@ -12,7 +12,8 @@ import { PAYROLL_PROVIDER, type PayrollProvider } from './payroll-provider';
  */
 export type ProcessEventOutcome =
   | 'succeeded' // PROCESSING -> SUCCEEDED, this run performed the full claim-provider-finalize cycle
-  | 'failed' // PROCESSING -> FAILED, same as above but the provider returned a failure
+  | 'failed' // PROCESSING -> FAILED (PERMANENT, or RETRYABLE with budget exhausted) — terminal
+  | 'retry-scheduled' // PROCESSING -> PENDING (transient failure, budget remains) — not terminal
   | 'terminal' // event was already SUCCEEDED or FAILED — safe no-op
   | 'already-processing' // event was already PROCESSING — safe no-op
   | 'lost-race' // a CAS this call attempted matched zero rows — another writer won first
@@ -28,10 +29,20 @@ type ClaimResult = { outcome: 'claimed'; event: PayrollEvent } | { outcome: 'los
 
 /**
  * The worker-side event lifecycle logic (architecture.md §8/§11/§13/§16/§17,
- * database-design.md §11/§12/§13/§18). Implements the full non-retry lifecycle:
+ * database-design.md §11/§12/§13/§18). Implements the full retry-aware lifecycle (retry/backoff
+ * design, R2):
  *
- *   PENDING -> PROCESSING -> SUCCEEDED (provider succeeds)
- *                          -> FAILED   (provider fails)
+ *   PENDING -> PROCESSING -> SUCCEEDED                (provider succeeds)
+ *                         -> FAILED (PERMANENT)        (provider fails, non-retryable)
+ *                         -> PENDING                   (provider fails, retryable, budget remains)
+ *                         -> FAILED (RETRYABLE)         (provider fails, retryable, budget exhausted)
+ *
+ * The `PENDING` re-entry above is not a new status — `PENDING` and `PROCESSING` both already
+ * existed; only the transition (and the history row recording it) is new. Retry *scheduling*
+ * itself (the backoff delay, the redelivery) is entirely BullMQ's job, configured on the queue
+ * (payroll-events-queue.provider.ts) — this class only ever decides "should this be retried,"
+ * persists that decision, and lets the caller (payroll-event-processor.ts) translate a
+ * `retry-scheduled` outcome into a thrown error so BullMQ actually redelivers the job.
  *
  * Postgres is the only source of truth here — the caller passes nothing but an `eventId`;
  * this service never trusts status/payload carried on the BullMQ job itself.
@@ -177,17 +188,35 @@ export class EventProcessingService {
       return this.finalizeSuccess(event.id, outcome.result);
     }
 
-    // R1 (retry/backoff design, Phase R1 — provider failure classification): the provider
-    // now reports `outcome.classification` ('TRANSIENT' | 'PERMANENT'), but this phase is
-    // scoped to that classification existing and being deterministic, not to acting on it.
-    // Every failure — regardless of classification — is still finalized straight to
-    // FAILED/PERMANENT below, exactly as before this field existed. Reacting differently to
-    // 'TRANSIENT' (returning to PENDING, checking attempts against maxAttempts, etc.) is R2's
-    // job, not this one's.
+    // R2 (retry/backoff design): a PERMANENT failure is never retried, regardless of how much
+    // attempt budget remains — retrying something known to be futile is pure waste. Same
+    // catch-and-finish shape as before R1 added `classification` at all.
+    if (outcome.classification === 'PERMANENT') {
+      this.logger.warn(
+        `provider failed (permanent): eventId=${event.id} reason=${outcome.failureReason}`,
+      );
+      return this.finalizeFailure(event.id, outcome.failureReason, 'PERMANENT');
+    }
+
+    // outcome.classification === 'TRANSIENT'. `event.attempts` here is the count AFTER this
+    // claim's own increment (claimForProcessing already committed it) — i.e. this claim IS
+    // attempt number `event.attempts`. Compare against `event.maxAttempts`, the per-event
+    // Postgres column (database-design.md §4) — this DB comparison, not BullMQ's own
+    // `job.attemptsMade`/`job.opts.attempts`, is what decides whether the business retry
+    // budget is exhausted. See processing.constants.ts (PAYROLL_EVENTS_JOB_ATTEMPTS) for why
+    // BullMQ's own, separately-configured delivery budget is a backstop, not the authority,
+    // and for the crash scenario where the two could diverge.
+    if (event.attempts < event.maxAttempts) {
+      this.logger.warn(
+        `provider failed (transient), retry budget remains: eventId=${event.id} attempts=${event.attempts}/${event.maxAttempts} reason=${outcome.failureReason}`,
+      );
+      return this.retryTransition(event.id, outcome.failureReason);
+    }
+
     this.logger.warn(
-      `provider failed: eventId=${event.id} classification=${outcome.classification} reason=${outcome.failureReason}`,
+      `provider failed (transient), retry budget exhausted: eventId=${event.id} attempts=${event.attempts}/${event.maxAttempts} reason=${outcome.failureReason}`,
     );
-    return this.finalizeFailure(event.id, outcome.failureReason);
+    return this.finalizeFailure(event.id, outcome.failureReason, 'RETRYABLE');
   }
 
   /**
@@ -235,17 +264,17 @@ export class EventProcessingService {
   }
 
   /**
-   * CAS `PROCESSING -> FAILED`. `failureType` is set to `'PERMANENT'` — the only fitting
-   * value available in the schema's existing `RETRYABLE|PERMANENT` model (database-design.md
-   * §4/§7's CHECK constraint) for a failure this phase treats as immediately terminal: no
-   * retry policy exists yet in this increment (explicitly out of scope), so nothing is ever
-   * "exhausted" here the way `RETRYABLE` implies (architecture.md §13). This is a deliberate,
-   * documented implementation decision for this phase, not a claim that every future failure
-   * will be `PERMANENT` — the retry-policy phase is expected to introduce the
-   * throw-vs-catch split that produces `RETRYABLE` outcomes too, without changing this schema.
-   * `result` is deliberately left untouched (stays `NULL`) — only a SUCCEEDED event has one.
+   * CAS `PROCESSING -> PENDING` (retry/backoff design, R2): persists a retryable failure that
+   * still has attempt budget remaining. Guarded exactly like every other worker-side
+   * transition — only a call that finds the row still `PROCESSING` may write. Deliberately
+   * does NOT touch `attempts` (that only ever increments at claim time — database-design.md
+   * §4: "incremented on each PENDING -> PROCESSING claim") and does NOT set
+   * `processingFinishedAt` (this is not a terminal transition). Does not invoke the provider
+   * again and does not schedule anything itself — the caller (payroll-event-processor.ts)
+   * is what turns a `retry-scheduled` outcome into a thrown error, which is what actually
+   * causes BullMQ to redeliver this job after its configured backoff delay.
    */
-  private async finalizeFailure(
+  private async retryTransition(
     eventId: string,
     failureReason: string,
   ): Promise<ProcessEventResult> {
@@ -253,9 +282,55 @@ export class EventProcessingService {
       const { count } = await tx.payrollEvent.updateMany({
         where: { id: eventId, status: 'PROCESSING' },
         data: {
+          status: 'PENDING',
+          updatedAt: new Date(),
+        },
+      });
+
+      if (count === 0) {
+        this.logger.warn(`PROCESSING -> PENDING (retry) CAS matched no row: eventId=${eventId}`);
+        return { outcome: 'lost-race' as const };
+      }
+
+      const updated = await tx.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
+
+      await tx.eventStatusHistory.create({
+        data: {
+          eventId,
+          fromStatus: 'PROCESSING',
+          toStatus: 'PENDING',
+          attemptNumber: updated.attempts,
+          errorMessage: failureReason,
+        },
+      });
+
+      this.logger.warn(
+        `PROCESSING -> PENDING (retry scheduled via BullMQ): eventId=${eventId} attempts=${updated.attempts}/${updated.maxAttempts}`,
+      );
+      return { outcome: 'retry-scheduled' as const, event: updated };
+    });
+  }
+
+  /**
+   * CAS `PROCESSING -> FAILED`. `failureType` is now caller-supplied (retry/backoff design,
+   * R2) — `'PERMANENT'` for a non-retryable business rejection, `'RETRYABLE'` for a transient
+   * failure whose attempt budget is exhausted (database-design.md §4/§7's existing
+   * `RETRYABLE|PERMANENT` CHECK constraint already anticipates exactly these two values; no
+   * schema change was needed to support this). `result` is deliberately left untouched (stays
+   * `NULL`) — only a SUCCEEDED event has one.
+   */
+  private async finalizeFailure(
+    eventId: string,
+    failureReason: string,
+    failureType: 'PERMANENT' | 'RETRYABLE',
+  ): Promise<ProcessEventResult> {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.payrollEvent.updateMany({
+        where: { id: eventId, status: 'PROCESSING' },
+        data: {
           status: 'FAILED',
           failureReason,
-          failureType: 'PERMANENT',
+          failureType,
           processingFinishedAt: new Date(),
           updatedAt: new Date(),
         },
