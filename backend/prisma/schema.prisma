@@ -104,6 +104,14 @@ model PayrollEvent {
   // Reconciliation sweep (WHERE status='PENDING' AND submitted_at < :threshold) and
   // general status-filtered listing. See database-design.md §8/§14.
   @@index([status, submittedAt], map: "payroll_events_status_submitted_at_idx")
+  // Stale-processing recovery sweep (retry/backoff design, R4 — WHERE status='PROCESSING'
+  // AND processing_started_at < :threshold). A DIFFERENT sweep from the one above: that one
+  // finds PENDING events with no BullMQ job (the submit/enqueue gap, architecture.md §15);
+  // this one finds PROCESSING events whose worker appears to have crashed or stalled
+  // (architecture.md §14's "crash during processing" scenario). Reusing the (status,
+  // submittedAt) index above would not serve this query — submittedAt is unrelated to how
+  // long an event has been PROCESSING.
+  @@index([status, processingStartedAt], map: "payroll_events_status_processing_started_at_idx")
   @@map("payroll_events")
 }
 

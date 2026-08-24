@@ -17,7 +17,8 @@ export type ProcessEventOutcome =
   | 'terminal' // event was already SUCCEEDED or FAILED — safe no-op
   | 'already-processing' // event was already PROCESSING — safe no-op
   | 'lost-race' // a CAS this call attempted matched zero rows — another writer won first
-  | 'missing'; // no event exists for this id
+  | 'missing' // no event exists for this id
+  | 'not-processing'; // R4 only: recoverStaleProcessing found the event already moved on from PROCESSING
 
 export interface ProcessEventResult {
   outcome: ProcessEventOutcome;
@@ -428,5 +429,85 @@ export class EventProcessingService {
 
     this.logger.warn(`backstop: finalized event as FAILED/RETRYABLE: eventId=${eventId}`);
     return true;
+  }
+
+  /**
+   * Stale-PROCESSING recovery (retry/backoff design, R4). Called ONLY by
+   * StaleProcessingSweepService, for an event ID its own Postgres-only candidate query found
+   * with `status='PROCESSING' AND processing_started_at` older than the approved staleness
+   * threshold (`STALE_PROCESSING_TIMEOUT_MS`, processing.constants.ts). That query is a
+   * candidate list only, never the correctness mechanism — exactly like every other
+   * worker-side guard in this codebase, this method re-reads the event fresh and guards every
+   * write on the row's CURRENT status via CAS, never on what the sweep's SELECT saw a moment
+   * ago (this closes the exact race §7 of the R4 design asks to be tested: recovery racing a
+   * still-alive worker that is about to legitimately finish the same event — whichever write
+   * actually happens first wins the CAS; the other observes `count: 0` and does nothing).
+   *
+   * Two outcomes once an event is confirmed still PROCESSING, mirroring R2's own
+   * transient-failure decision exactly and reusing its two private methods — the CAS/
+   * transaction logic itself is not duplicated, only the decision of which one to call:
+   *   - `attempts < maxAttempts`: CAS PROCESSING -> PENDING (`retryTransition`) — the event
+   *     becomes eligible for another claim. Recovery itself never increments `attempts` (only
+   *     a successful claim does that, per R2's unchanged semantics) — the NEXT successful
+   *     claim increments it by exactly one, indistinguishable from any other retry.
+   *   - `attempts >= maxAttempts`: the budget is already exhausted — returning the event to
+   *     PENDING would let a 6th claim happen, which R2's own budget exists to prevent.
+   *     Finalizes straight to FAILED/RETRYABLE instead (`finalizeFailure`), the same terminal
+   *     shape R3's exhaustion backstop produces, just triggered by elapsed time instead of
+   *     BullMQ's own exhaustion signal.
+   *
+   * Idempotent: running this repeatedly for the same event is always safe. If the event is no
+   * longer PROCESSING (already finalized by a worker that, it turns out, was still alive;
+   * already recovered by an earlier sweep tick; already re-claimed) this returns
+   * `'not-processing'` without writing anything. If two sweep ticks (or a sweep tick and a
+   * live worker) race, the CAS inside `retryTransition`/`finalizeFailure` — not this method's
+   * own initial read — is what guarantees only one of them can ever actually write.
+   */
+  async recoverStaleProcessing(eventId: string): Promise<ProcessEventResult> {
+    const event = await this.prisma.payrollEvent.findUnique({ where: { id: eventId } });
+
+    if (!event) {
+      this.logger.warn(`stale recovery: event not found, nothing to recover: eventId=${eventId}`);
+      return { outcome: 'missing' };
+    }
+
+    if (event.status !== 'PROCESSING') {
+      // Already moved on by the time this ran — a safe no-op, not an error. Most commonly:
+      // the worker was actually still alive and finished normally; a prior sweep tick already
+      // recovered it; or it was re-claimed after an earlier recovery.
+      this.logger.log(
+        `stale recovery: event is ${event.status}, not PROCESSING — nothing to recover: eventId=${eventId}`,
+      );
+      return { outcome: 'not-processing', event };
+    }
+
+    const reason =
+      'Processing appears abandoned: no completion recorded since processing started, past the staleness threshold.';
+
+    if (event.attempts < event.maxAttempts) {
+      const result = await this.retryTransition(eventId, reason);
+      if (result.outcome === 'retry-scheduled') {
+        this.logger.warn(
+          `stale recovery: PROCESSING -> PENDING, eligible for reclaim: eventId=${eventId} attempts=${event.attempts}/${event.maxAttempts}`,
+        );
+      } else {
+        this.logger.log(
+          `stale recovery: CAS lost, event already left PROCESSING: eventId=${eventId}`,
+        );
+      }
+      return result;
+    }
+
+    const result = await this.finalizeFailure(eventId, reason, 'RETRYABLE');
+    if (result.outcome === 'failed') {
+      this.logger.warn(
+        `stale recovery: attempt budget already exhausted, finalized FAILED/RETRYABLE: eventId=${eventId}`,
+      );
+    } else {
+      this.logger.log(
+        `stale recovery: CAS lost, event already left PROCESSING: eventId=${eventId}`,
+      );
+    }
+    return result;
   }
 }

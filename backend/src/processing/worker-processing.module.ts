@@ -3,6 +3,7 @@ import { Worker } from 'bullmq';
 import { ProcessingModule } from './processing.module';
 import { EventProcessingService } from './event-processing.service';
 import { payrollEventsWorkerProvider } from './payroll-events-worker.provider';
+import { StaleProcessingSweepService } from './stale-processing-sweep.service';
 import { PAYROLL_EVENTS_WORKER } from './processing.constants';
 import { PAYROLL_PROVIDER } from './payroll-provider';
 import { SimulatedPayrollProvider } from './simulated-payroll-provider';
@@ -24,12 +25,18 @@ import { SimulatedPayrollProvider } from './simulated-payroll-provider';
  * ProcessingModule: it is exclusively a worker-processing concern — the API never invokes
  * it — and EventProcessingService depends on it only through the PAYROLL_PROVIDER interface
  * token, never on SimulatedPayrollProvider directly.
+ *
+ * StaleProcessingSweepService (retry/backoff design, R4) is registered here for the same
+ * reason: crash recovery is exclusively a worker-side concern, and it needs
+ * PayrollEventsQueueService (re-exported by ProcessingModule, already imported above) to
+ * re-enqueue events it recovers — no second queue, no second connection.
  */
 @Module({
   imports: [ProcessingModule],
   providers: [
     EventProcessingService,
     payrollEventsWorkerProvider,
+    StaleProcessingSweepService,
     { provide: PAYROLL_PROVIDER, useClass: SimulatedPayrollProvider },
   ],
 })

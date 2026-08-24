@@ -463,4 +463,157 @@ describe('EventProcessingService', () => {
       expect(create).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('R4: recoverStaleProcessing (stale-processing sweep)', () => {
+    const buildService = (event: Record<string, unknown> | null) => {
+      const fake = buildFakePrisma(event);
+      // recoverStaleProcessing never calls the provider — a provider that would fail loudly
+      // if invoked proves that structurally.
+      const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
+      const service = new EventProcessingService(fake.prisma as never, provider);
+      return { ...fake, provider, service };
+    };
+
+    it('is a no-op ("missing") when the event does not exist', async () => {
+      const { service, prisma, provider } = buildService(null);
+
+      const result = await service.recoverStaleProcessing('missing-id');
+
+      expect(result).toEqual({ outcome: 'missing' });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(provider.apply).not.toHaveBeenCalled();
+    });
+
+    it.each(['SUCCEEDED', 'FAILED', 'PENDING'])(
+      'is a no-op ("not-processing") when the event is %s, not PROCESSING',
+      async (status) => {
+        const event = { id: 'e1', status };
+        const { service, prisma, provider } = buildService(event);
+
+        const result = await service.recoverStaleProcessing('e1');
+
+        expect(result).toEqual({ outcome: 'not-processing', event });
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(provider.apply).not.toHaveBeenCalled();
+      },
+    );
+
+    it('returns a PROCESSING event with budget remaining to PENDING, without touching attempts', async () => {
+      const { service, updateMany, create } = buildService({
+        id: 'e1',
+        status: 'PROCESSING',
+        attempts: 2,
+        maxAttempts: 5,
+      });
+
+      const result = await service.recoverStaleProcessing('e1');
+
+      expect(result.outcome).toBe('retry-scheduled');
+      expect(updateMany).toHaveBeenCalledTimes(1);
+      const call = updateMany.mock.calls[0][0];
+      expect(call).toEqual({
+        where: { id: 'e1', status: 'PROCESSING' },
+        data: expect.objectContaining({ status: 'PENDING' }),
+      });
+      expect(call.data.attempts).toBeUndefined(); // never touched by recovery
+      expect(call.data.processingFinishedAt).toBeUndefined(); // not a terminal transition
+      expect(create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventId: 'e1',
+          fromStatus: 'PROCESSING',
+          toStatus: 'PENDING',
+          attemptNumber: 2,
+        }),
+      });
+    });
+
+    it('finalizes a PROCESSING event whose budget is already exhausted to FAILED/RETRYABLE (does not return it to PENDING)', async () => {
+      const { service, updateMany, create } = buildService({
+        id: 'e1',
+        status: 'PROCESSING',
+        attempts: 5,
+        maxAttempts: 5,
+      });
+
+      const result = await service.recoverStaleProcessing('e1');
+
+      expect(result.outcome).toBe('failed');
+      expect(updateMany).toHaveBeenCalledTimes(1);
+      expect(updateMany).toHaveBeenCalledWith({
+        where: { id: 'e1', status: 'PROCESSING' },
+        data: expect.objectContaining({ status: 'FAILED', failureType: 'RETRYABLE' }),
+      });
+      expect(create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventId: 'e1',
+          fromStatus: 'PROCESSING',
+          toStatus: 'FAILED',
+          attemptNumber: 5,
+        }),
+      });
+    });
+
+    it('persists a fixed, generic, domain-oriented reason — never a raw crash/error detail (there is none to leak: this method takes no external error input)', async () => {
+      const { service, create } = buildService({
+        id: 'e1',
+        status: 'PROCESSING',
+        attempts: 1,
+        maxAttempts: 5,
+      });
+
+      await service.recoverStaleProcessing('e1');
+
+      const historyCall = create.mock.calls[0][0];
+      expect(historyCall.data.errorMessage).toMatch(/abandoned/i);
+      expect(historyCall.data.errorMessage).toMatch(/threshold/i);
+    });
+
+    it('is a no-op if the CAS loses the race while returning to PENDING (a live worker finished first)', async () => {
+      const { service, updateMany } = buildService({
+        id: 'e1',
+        status: 'PROCESSING',
+        attempts: 1,
+        maxAttempts: 5,
+      });
+      updateMany.mockResolvedValueOnce({ count: 0 });
+
+      const result = await service.recoverStaleProcessing('e1');
+
+      expect(result).toEqual({ outcome: 'lost-race' });
+    });
+
+    it('is a no-op if the CAS loses the race while finalizing an exhausted event', async () => {
+      const { service, updateMany } = buildService({
+        id: 'e1',
+        status: 'PROCESSING',
+        attempts: 5,
+        maxAttempts: 5,
+      });
+      updateMany.mockResolvedValueOnce({ count: 0 });
+
+      const result = await service.recoverStaleProcessing('e1');
+
+      expect(result).toEqual({ outcome: 'lost-race' });
+    });
+
+    it('is idempotent: calling it twice in a row only transitions once', async () => {
+      const event = { id: 'e1', status: 'PROCESSING', attempts: 2, maxAttempts: 5 };
+      const { prisma, updateMany, create } = buildFakePrisma(event);
+      const findUnique = jest
+        .fn()
+        .mockResolvedValueOnce(event)
+        .mockResolvedValueOnce({ ...event, status: 'PENDING' });
+      (prisma.payrollEvent as { findUnique: typeof findUnique }).findUnique = findUnique;
+      const provider = buildFakeProvider({ outcome: 'SUCCESS', result: {} });
+      const service = new EventProcessingService(prisma as never, provider);
+
+      const first = await service.recoverStaleProcessing('e1');
+      const second = await service.recoverStaleProcessing('e1');
+
+      expect(first.outcome).toBe('retry-scheduled');
+      expect(second).toEqual({ outcome: 'not-processing', event: { ...event, status: 'PENDING' } });
+      expect(updateMany).toHaveBeenCalledTimes(1);
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+  });
 });

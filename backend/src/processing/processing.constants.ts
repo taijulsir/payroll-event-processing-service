@@ -51,3 +51,24 @@ export const PAYROLL_EVENTS_JOB_ATTEMPTS = 5;
  * approved design, and this assignment's scale has no thundering-herd scenario to justify it.
  */
 export const PAYROLL_EVENTS_JOB_BACKOFF_BASE_DELAY_MS = 2000;
+
+/**
+ * Retry/backoff design, R4 — approved decision: how old `processing_started_at` must be
+ * before a PROCESSING event is considered stale/abandoned (e.g. its worker crashed) and
+ * eligible for stale-processing-sweep.service.ts to recover it. No architecture/database
+ * design document specifies this value; it was explicitly approved as 2 minutes (see the R4
+ * design-decision record) given the simulated provider resolves near-instantly today, making
+ * any real legitimate processing far shorter than this threshold.
+ */
+export const STALE_PROCESSING_TIMEOUT_MS = 2 * 60 * 1000;
+
+/**
+ * Retry/backoff design, R4 — how often the stale-processing sweep runs. Architecture.md §15
+ * specifies only the pattern ("run on worker startup and on a fixed interval") for its own,
+ * different sweep, not a value; no scheduling dependency exists in this codebase, so a plain
+ * `setInterval` is used (approved: no new dependency). 30 seconds keeps recovery latency well
+ * under the 2-minute staleness threshold without polling Postgres excessively — this specific
+ * number was not separately re-confirmed after the timeout was set to 2 minutes and should be
+ * revisited if that trade-off (recovery latency vs. sweep frequency) needs tuning.
+ */
+export const STALE_PROCESSING_SWEEP_INTERVAL_MS = 30 * 1000;
