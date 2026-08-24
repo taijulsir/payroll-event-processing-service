@@ -200,8 +200,8 @@ export default function SubmitEventPage() {
           </p>
         </div>
         <div className="page-header__actions">
-          <Link href="/" className="btn btn-secondary">
-            ← Back to Stream
+          <Link href="/events/" className="btn btn-secondary">
+            ← Back to Events
           </Link>
         </div>
       </div>
@@ -490,7 +490,7 @@ export default function SubmitEventPage() {
           )}
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, paddingTop: 8 }}>
-            <Link href="/" className="btn btn-secondary">
+            <Link href="/events/" className="btn btn-secondary">
               Cancel
             </Link>
             <button type="submit" className="btn btn-primary" disabled={submitting}>

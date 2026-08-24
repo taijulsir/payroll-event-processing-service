@@ -1,10 +1,9 @@
 import type { Metadata } from 'next';
 import './globals.css';
-import Link from 'next/link';
-import { NavLinks } from '../components/NavLinks';
+import { AppShell } from '../components/AppShell';
 
 export const metadata: Metadata = {
-  title: 'Payroll Event Processing',
+  title: 'Payroll Event Processing — Operations Console',
   description: 'Operations console for asynchronous payroll event processing and audit telemetry.',
   icons: {
     icon: '/icon.svg',
@@ -22,18 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
       </head>
       <body>
-        <header className="app-header">
-          <div className="app-header__container">
-            <Link href="/" className="app-brand" aria-label="Payroll Event Processing Home">
-              <div className="app-brand__icon">⚡</div>
-              <span className="app-brand__title">Payroll Event Processing</span>
-            </Link>
-            <nav className="app-nav" aria-label="Primary Navigation">
-              <NavLinks />
-            </nav>
-          </div>
-        </header>
-        <main className="app-main">{children}</main>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );
