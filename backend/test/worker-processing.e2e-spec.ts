@@ -11,23 +11,28 @@ import {
 } from '../src/processing/processing.constants';
 import { createPayrollEventProcessor } from '../src/processing/payroll-event-processor';
 import { EventProcessingService } from '../src/processing/event-processing.service';
+import { SimulatedPayrollProvider } from '../src/processing/simulated-payroll-provider';
 import type Redis from 'ioredis';
 
 /**
- * Worker foundation + PENDING -> PROCESSING (this phase). Runs against real PostgreSQL AND
- * real Redis/BullMQ — the whole point of this phase is a concurrency-correct, atomic
- * transition, which a mocked Prisma client cannot demonstrate.
+ * Worker foundation + full lifecycle (worker-processing phase, extended by the
+ * payroll-provider phase). Runs against real PostgreSQL AND real Redis/BullMQ — the whole
+ * point of these phases is a concurrency-correct, atomic transition, which a mocked Prisma
+ * client cannot demonstrate.
  *
  * The test worker below is a genuine `bullmq.Worker` consuming the real `payroll-events`
  * queue (same queue name constant the API's producer uses) — not a direct call into
  * EventProcessingService pretending to be "the worker". `EventsModule`'s AppModule bootstrap
  * (via ProcessingModule) supplies the producer side (POST /events -> real job); this file's
  * own Worker instance supplies the consumer side, deliberately built the same way
- * WorkerProcessingModule builds it in worker.ts, so this test exercises the real integration
- * path end to end: POST /events -> PostgreSQL PENDING -> BullMQ job -> real worker consumes
- * -> PostgreSQL PROCESSING -> status history contains the transition.
+ * WorkerProcessingModule builds it in worker.ts (including the real SimulatedPayrollProvider,
+ * not a mock), so this test exercises the real integration path end to end. Since a normal
+ * event now runs all the way to a terminal state automatically (this phase's addition), these
+ * tests wait for SUCCEEDED, not PROCESSING — the deeper, provider-specific
+ * success/failure/duplicate/concurrency scenarios live in test/payroll-provider.e2e-spec.ts;
+ * this file keeps its original focus on worker pickup and error isolation.
  */
-describe('Worker: PENDING -> PROCESSING', () => {
+describe('Worker: PENDING -> PROCESSING -> SUCCEEDED', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let redis: Redis;
@@ -92,7 +97,7 @@ describe('Worker: PENDING -> PROCESSING', () => {
 
     prisma = app.get(PrismaService);
     redis = app.get(REDIS_CONNECTION);
-    eventProcessingService = new EventProcessingService(prisma);
+    eventProcessingService = new EventProcessingService(prisma, new SimulatedPayrollProvider());
 
     // A real BullMQ Worker, built the same way WorkerProcessingModule builds one in
     // worker.ts, consuming the same real queue the API just enqueued a job onto.
@@ -113,33 +118,50 @@ describe('Worker: PENDING -> PROCESSING', () => {
     await app.close();
   });
 
-  it('a real worker consumes a real job produced by POST /events: PENDING -> PROCESSING, with history', async () => {
+  it('a real worker consumes a real job produced by POST /events and runs the full lifecycle: PENDING -> PROCESSING -> SUCCEEDED, with history', async () => {
     const res = await submit(addressPayload({ employeeId: employeeId('pickup') })).expect(202);
     const eventId = res.body.id as string;
 
-    const dbEventBefore = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
-    expect(dbEventBefore.status).toBe('PENDING');
-
+    // Deliberately not asserting the event is PENDING immediately after submit here: with the
+    // real worker in this same process now running the full lifecycle with no artificial
+    // delay, that read would race the worker and could observe PENDING, PROCESSING, or already
+    // SUCCEEDED depending on scheduling — exactly the kind of timing-dependent assertion this
+    // phase's tests must avoid. queue-integration.e2e-spec.ts's "job creation" test already
+    // covers "the event is genuinely PENDING right after submission" in isolation, with no
+    // worker running in that file to race against.
+    //
+    // A normal employeeId (no deterministic-failure marker) always succeeds, and the
+    // simulated provider adds no artificial delay, so the worker runs claim -> provider ->
+    // finalize to completion on its own; waiting for the terminal state (rather than for the
+    // transient PROCESSING state) is what makes this assertion non-flaky.
     await waitUntil(async () => {
       const event = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
-      return event.status === 'PROCESSING';
+      return event.status === 'SUCCEEDED';
     });
 
     const dbEventAfter = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
-    expect(dbEventAfter.status).toBe('PROCESSING');
+    expect(dbEventAfter.status).toBe('SUCCEEDED');
     expect(dbEventAfter.attempts).toBe(1);
     expect(dbEventAfter.processingStartedAt).not.toBeNull();
+    expect(dbEventAfter.processingFinishedAt).not.toBeNull();
+    expect(dbEventAfter.result).not.toBeNull();
 
     // Submission itself already wrote a (null -> PENDING) history row (established in the
-    // event-submission phase); this test is only concerned with the transition the worker
+    // event-submission phase); this test is only concerned with the transitions the worker
     // adds on top of that.
     const history = await prisma.eventStatusHistory.findMany({
-      where: { eventId, fromStatus: 'PENDING', toStatus: 'PROCESSING' },
+      where: { eventId, NOT: { fromStatus: null } },
+      orderBy: { occurredAt: 'asc' },
     });
-    expect(history).toHaveLength(1);
+    expect(history).toHaveLength(2);
     expect(history[0]).toMatchObject({
       fromStatus: 'PENDING',
       toStatus: 'PROCESSING',
+      attemptNumber: 1,
+    });
+    expect(history[1]).toMatchObject({
+      fromStatus: 'PROCESSING',
+      toStatus: 'SUCCEEDED',
       attemptNumber: 1,
     });
   });
@@ -161,41 +183,10 @@ describe('Worker: PENDING -> PROCESSING', () => {
     },
   );
 
-  it('concurrent processing: two independent processing attempts on the same PENDING event yield exactly one PROCESSING transition', async () => {
-    const event = await seedEvent();
-
-    // Two separate PrismaService connections, each with its own EventProcessingService,
-    // simulating two independent worker processes racing to claim the same event — a single
-    // shared client typically serializes its own statements sequentially, which would be a
-    // weaker test of genuine concurrent database access.
-    const prismaA = new PrismaService();
-    const prismaB = new PrismaService();
-    await prismaA.$connect();
-    await prismaB.$connect();
-    const serviceA = new EventProcessingService(prismaA);
-    const serviceB = new EventProcessingService(prismaB);
-
-    try {
-      const [resultA, resultB] = await Promise.all([
-        serviceA.processEvent(event.id),
-        serviceB.processEvent(event.id),
-      ]);
-
-      const outcomes = [resultA.outcome, resultB.outcome].sort();
-      expect(outcomes).toEqual(['claimed', 'lost-race']);
-
-      const after = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: event.id } });
-      expect(after.status).toBe('PROCESSING');
-      expect(after.attempts).toBe(1); // incremented exactly once, not twice
-
-      const history = await prisma.eventStatusHistory.findMany({ where: { eventId: event.id } });
-      expect(history).toHaveLength(1);
-      expect(history[0]).toMatchObject({ fromStatus: 'PENDING', toStatus: 'PROCESSING' });
-    } finally {
-      await prismaA.$disconnect();
-      await prismaB.$disconnect();
-    }
-  });
+  // The concurrent-processing race test (two independent EventProcessingService instances
+  // attempting the same PENDING event) moved to test/payroll-provider.e2e-spec.ts, where it
+  // now also asserts the provider is invoked exactly once — a strict superset of what this
+  // file's original version checked, so it is not duplicated here.
 
   it('missing event: a job for a nonexistent eventId does not crash the worker and processes as a safe no-op', async () => {
     const nonexistentEventId = randomUUID();
@@ -210,11 +201,11 @@ describe('Worker: PENDING -> PROCESSING', () => {
 
     await waitUntil(async () => {
       const dbEvent = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
-      return dbEvent.status === 'PROCESSING';
+      return dbEvent.status === 'SUCCEEDED';
     });
 
     const dbEvent = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
-    expect(dbEvent.status).toBe('PROCESSING');
+    expect(dbEvent.status).toBe('SUCCEEDED');
   });
 
   it('a job whose data has no eventId fails cleanly without crashing the worker or affecting other jobs', async () => {
@@ -249,7 +240,7 @@ describe('Worker: PENDING -> PROCESSING', () => {
       const eventId = res.body.id as string;
       await waitUntil(async () => {
         const dbEvent = await prisma.payrollEvent.findUniqueOrThrow({ where: { id: eventId } });
-        return dbEvent.status === 'PROCESSING';
+        return dbEvent.status === 'SUCCEEDED';
       });
     } finally {
       worker.off('failed', onFailed);
