@@ -1,31 +1,418 @@
 # Payroll Event Processing Service
 
-Backend Engineering Technical Assignment — a NestJS + PostgreSQL + Redis/BullMQ service
-that accepts payroll events (bank account change, address change, salary change) over HTTP
-and processes them asynchronously against a simulated external payroll provider.
+A backend service that accepts payroll-related events (bank account changes, address
+changes, salary changes) over HTTP and processes them asynchronously against a simulated
+external payroll provider, using PostgreSQL as the durable source of truth and Redis/BullMQ
+for the work queue. Built with NestJS and TypeScript.
 
-> **Status**: under active development. This README is a placeholder scaffolded in Phase 1
-> of the implementation plan (see `docs/assignment.md`) and will be filled in fully in the
-> final documentation phase.
+## Overview
 
-## Planned sections
+The system separates two concerns: **accepting** a payroll event (fast, synchronous, durable)
+and **processing** it (slow, asynchronous, retried on failure). An HTTP request never waits
+for processing to finish.
 
-- Installation
-- Environment variables
-- Docker setup (`docker compose up`)
-- Database setup and migrations
-- Running the API
-- Running the worker
-- Running tests
-- Architecture overview (with diagram)
-- Database design
-- Background processing design
-- Key engineering decisions and trade-offs
-
-## Repository layout
+Main flow:
 
 ```
-backend/    NestJS API + worker (shared codebase, two entrypoints)
-frontend/   Minimal demonstration UI
-docs/       Assignment brief
+Client → API (validate, persist, enqueue) → PostgreSQL (durable state)
+                                           → Redis/BullMQ (work queue)
+                                                → Worker (claim, call provider, persist outcome)
+                                                     → Simulated Payroll Provider
 ```
+
+The API is the only writer of new events and the only reader for status/history. The worker
+is a separate process that consumes jobs from BullMQ, always re-reads the current state from
+PostgreSQL (never trusts the job payload as truth), and performs the actual state transition.
+PostgreSQL is authoritative for every fact about an event; Redis holds only pending work, never
+business state.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Client["Client / Frontend"] -->|"POST /events, GET /events, GET /events/:id"| API["NestJS API"]
+    API -->|"insert event, assign sequence, write history"| DB[("PostgreSQL")]
+    API -->|"enqueue job (after commit)"| Queue["Redis / BullMQ"]
+    Queue -->|"deliver job"| Worker["NestJS Worker"]
+    Worker -->|"claim (CAS), write result + history"| DB
+    Worker -->|"simulated call"| Provider["Simulated Payroll Provider"]
+    Client -->|"GET /health"| API
+    API -.->|"liveness check"| DB
+    API -.->|"liveness check"| Queue
+```
+
+| Component | Role |
+|---|---|
+| **API** (`backend/src/main.ts`) | Validates requests, persists events, assigns per-employee sequence numbers, enforces idempotency, enqueues work after commit, serves read endpoints. Stateless. |
+| **PostgreSQL** | The single source of durable, authoritative state — current status, attempts, result, and full transition history for every event. |
+| **Redis / BullMQ** | The work queue only. Holds pending jobs, not business state. If Redis is unavailable when a job would be enqueued, the event stays durably `PENDING` in Postgres and is recovered later (see [Failure and Recovery](#failure-and-recovery)). |
+| **Worker** (`backend/src/worker.ts`) | A second entrypoint sharing the same application code as the API. Consumes jobs, claims events with an atomic compare-and-swap, invokes the provider, persists the outcome, and runs the periodic recovery/reconciliation sweeps. Runs as a separate process from the API. |
+| **Simulated Payroll Provider** (`backend/src/processing/simulated-payroll-provider.ts`) | An in-process stand-in for a real external payroll system. Performs basic business validation, adds latency, and fails transiently or permanently at configurable rates — no real external integration, per the assignment. |
+| **Frontend** (`frontend/`) | A minimal Next.js UI that talks to the API directly from the browser to submit and observe events — see [Frontend](#frontend). |
+
+## Core Guarantees
+
+Only what is actually implemented and tested:
+
+- **Idempotent submission**: `POST /events` requires an `Idempotency-Key` header. The key is
+  enforced by a database `UNIQUE` constraint; a retried request with the same key returns the
+  original event instead of creating a duplicate. Reusing a key with a materially different
+  payload is rejected with `409 Conflict`.
+- **Per-employee ordering**: events for the same employee are processed in the order they were
+  accepted. The claim step atomically checks "does an earlier, non-terminal event for this
+  employee exist?" as part of the same guarded database statement that claims the job — never
+  as a separate check-then-act step. A blocked job is deferred (BullMQ `moveToDelayed`) without
+  consuming its retry budget. Different employees process concurrently.
+- **Duplicate/concurrent processing safety**: an event is claimed via an atomic
+  `UPDATE ... WHERE status = 'PENDING'`; only one concurrent claim attempt can ever win. A
+  redelivered job for an already-terminal (`SUCCEEDED`/`FAILED`) event is a safe no-op.
+- **Retryable vs. permanent failures**: the simulated provider classifies each failure as
+  `TRANSIENT` or `PERMANENT`. Transient failures return the event to `PENDING` and are retried
+  (BullMQ backoff, up to a configured attempt budget); permanent failures go straight to
+  `FAILED` and are never retried.
+- **Retry-budget exhaustion backstop**: if BullMQ's own delivery attempts are exhausted before
+  the primary path finalizes an event, a `failed`-event listener reconciles it to
+  `FAILED`/`RETRYABLE` so it never stays stuck in `PROCESSING`.
+- **Stale-processing recovery**: a periodic sweep finds events stuck in `PROCESSING` past a
+  timeout (worker crashed mid-job) and returns them to `PENDING` for reclaiming, or finalizes
+  them as `FAILED` if their attempt budget is already spent.
+- **Enqueue-gap reconciliation**: the database commit and the Redis enqueue call are not in the
+  same transaction. A periodic sweep finds `PENDING` events older than a threshold with no
+  corresponding job and re-enqueues them, closing the gap if the initial enqueue call failed or
+  never happened.
+- **Explicit state model**: `PENDING → PROCESSING → SUCCEEDED`, `PROCESSING → PENDING` (retry),
+  `PROCESSING → FAILED` (permanent, or retries exhausted). Every transition is recorded in an
+  append-only history table in the same transaction as the state change.
+- **Provider invocation is at-least-once, not exactly-once**: in one narrow crash window (after
+  the provider call succeeds, before the finishing transaction commits), a redelivered job can
+  call the provider again. This is safe here because the provider is simulated and has no real
+  side effect outside Postgres; it would not be safe against a non-idempotent real provider.
+  Stated plainly rather than overclaimed.
+
+## Project Structure
+
+```
+payroll-event-processing-service/
+├── backend/
+│   ├── src/
+│   │   ├── main.ts            # HTTP API entrypoint
+│   │   ├── worker.ts          # BullMQ worker entrypoint
+│   │   ├── events/            # POST/GET /events — controller, DTOs, service
+│   │   ├── event-types/       # per-event-type validation DTOs + registry
+│   │   ├── processing/        # queue, worker processor, provider simulation,
+│   │   │                      #   retry/recovery/reconciliation sweeps
+│   │   ├── health/            # GET /health
+│   │   └── prisma/            # injectable Prisma client
+│   ├── prisma/                # schema.prisma + migrations
+│   ├── test/                  # e2e/integration tests (real Postgres + Redis)
+│   └── Dockerfile
+├── frontend/                  # Next.js static export (list / submit / detail)
+├── docs/
+│   ├── assignment.md          # original assignment brief (authoritative, unmodified)
+│   ├── architecture.md        # detailed architecture and design rationale
+│   └── database-design.md     # detailed schema, indexes, and constraint rationale
+├── docker-compose.yml         # postgres, redis, migrate, api, worker, frontend
+└── .github/workflows/ci.yml   # lint/typecheck/build/unit/e2e/docker-build pipeline
+```
+
+## Requirements
+
+- Docker and Docker Compose (the supported way to run the full system)
+- Node.js 20 and npm — only needed for running services outside Docker (matches
+  `node:20-alpine` used by both Dockerfiles and the CI pipeline's `node-version: '20'`)
+
+## Environment Variables
+
+Each `.env.example` file is the source of truth; copy it to `.env` in the same directory to
+override a default. None of the values below are real secrets — they are local-only
+development defaults.
+
+**Root `.env.example`** — host port overrides consumed only by `docker-compose.yml`'s own
+variable substitution, not read by the application:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `POSTGRES_PORT` | `5432` | Host port mapped to the `postgres` container |
+| `REDIS_PORT` | `6379` | Host port mapped to the `redis` container |
+| `API_PORT` | `3000` | Host port mapped to the `api` container |
+| `FRONTEND_PORT` | `3001` | Host port mapped to the `frontend` container |
+
+**`backend/.env.example`** — read by the API and worker processes:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | HTTP port the API listens on |
+| `NODE_ENV` | `development` | Standard Node environment flag |
+| `FRONTEND_ORIGIN` | `http://localhost:3001` | The single allowed CORS origin — must be the browser-reachable frontend URL, never a Docker-internal hostname |
+| `DATABASE_URL` | `postgresql://payroll:payroll@localhost:5432/payroll?schema=public` | Prisma/PostgreSQL connection string |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis connection used for BullMQ |
+| `PROVIDER_TRANSIENT_FAILURE_RATE` | `0.2` | Simulated provider's random transient-failure rate |
+| `PROVIDER_PERMANENT_FAILURE_RATE` | `0.05` | Simulated provider's random permanent-failure rate |
+| `PROVIDER_MIN_LATENCY_MS` / `PROVIDER_MAX_LATENCY_MS` | `200` / `2000` | Simulated provider latency range |
+
+**`frontend/.env.example`** — read at build time only (this is a static export; there is no
+frontend server at runtime):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:3000` | The backend API's browser-reachable base URL, baked into the static build |
+
+## Running with Docker Compose
+
+```bash
+docker compose up --build
+```
+
+This starts, in dependency order:
+
+1. **postgres** (`postgres:16-alpine`) and **redis** (`redis:7-alpine`) — with health checks.
+2. **migrate** — a one-off job that runs `prisma migrate deploy` against Postgres and exits;
+   `api` and `worker` wait for it to complete successfully before starting, so neither ever
+   queries an unmigrated schema.
+3. **api** — the HTTP API, published at `http://localhost:3000` by default.
+4. **worker** — the BullMQ consumer. No published port; it does not serve HTTP.
+5. **frontend** — a static Next.js export served by nginx, published at
+   `http://localhost:3001` by default.
+
+`api`, `worker`, and `migrate` all build from the same `backend/Dockerfile` (a single
+multi-stage image, selected via a different `command:` per service) — there is no second
+backend Dockerfile. `frontend` builds from its own `frontend/Dockerfile`.
+
+Once running:
+
+- API: `http://localhost:3000`
+- Health check: `http://localhost:3000/health`
+- Swagger UI: `http://localhost:3000/api`
+- Frontend: `http://localhost:3001`
+
+## Database Migrations
+
+Migrations are Prisma migrations under `backend/prisma/migrations/`. In Docker Compose, the
+`migrate` service applies them automatically on every `docker compose up` by running
+`prisma migrate deploy` (idempotent — a no-op if the schema is already current) before `api`
+or `worker` start. There is no separate manual migration step required for the Docker
+workflow.
+
+Outside Docker, from `backend/`:
+
+```bash
+npm run prisma:migrate:deploy   # apply existing migrations (non-interactive)
+npm run prisma:migrate:dev      # create/apply a migration during local development
+npm run prisma:validate         # validate schema.prisma without connecting to a database
+```
+
+## Running Locally Without Docker
+
+Requires a reachable PostgreSQL and Redis (for example, `docker compose up postgres redis`)
+and `backend/.env` configured to point at them. From `backend/`:
+
+```bash
+npm install
+npm run prisma:migrate:deploy
+npm run start:dev     # API, watch mode
+npm run worker:dev    # worker, watch mode — run in a second terminal
+```
+
+From `frontend/`, with `frontend/.env` pointing `NEXT_PUBLIC_API_BASE_URL` at the running API:
+
+```bash
+npm install
+npm run dev
+```
+
+## API
+
+Base path: none (routes are mounted at the API root). All responses are JSON.
+
+| Method | Path | Purpose | Key request fields | Required headers | Status codes |
+|---|---|---|---|---|---|
+| `GET` | `/health` | Liveness of the API and its dependencies | — | — | `200` (all dependencies up), `503` (at least one down) |
+| `POST` | `/events` | Submit a payroll event for asynchronous processing | `eventType`, `employeeId`, `effectiveDate`, plus fields specific to `eventType` (see below) | `Idempotency-Key` (required) | `202` accepted, `400` invalid input, `409` idempotency key reused with a different payload |
+| `GET` | `/events` | List submitted events | Query: `employeeId?`, `status?`, `limit?` (default 20, max 100), `offset?` | — | `200` |
+| `GET` | `/events/:id` | Retrieve one event, including its full status history | — | — | `200`, `404` if no event exists with that id |
+
+`GET /api` and `GET /api-json` serve the interactive Swagger UI and the raw OpenAPI document.
+
+**Supported `eventType` values and their type-specific fields**:
+
+| `eventType` | Additional required fields |
+|---|---|
+| `BANK_ACCOUNT_CHANGE` | `iban` |
+| `ADDRESS_CHANGE` | `street`, `city`, `postalCode`, `country` |
+| `SALARY_CHANGE` | `newSalary`, `currency` |
+
+Request bodies are flat JSON objects — `eventType` is a sibling field, not nested under a
+`payload` key. Unknown fields are rejected (`400`), not silently ignored.
+
+Example:
+
+```bash
+curl -X POST http://localhost:3000/events \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+    "eventType": "ADDRESS_CHANGE",
+    "employeeId": "emp-1001",
+    "effectiveDate": "2026-09-01",
+    "street": "1 Example Street",
+    "city": "Berlin",
+    "postalCode": "10115",
+    "country": "DE"
+  }'
+```
+
+The response is the persisted event (`id`, `employeeId`, `eventType`, `sequence`, `status`,
+`attempts`, `maxAttempts`, `result`, `failureReason`, `failureType`, and timestamps).
+`GET /events/:id` returns the same shape plus `statusHistory`, an ordered array of every
+transition the event has gone through. `sequence` is serialized as a decimal string (it is a
+64-bit value on the server) to avoid precision loss in JSON.
+
+## Event Processing Lifecycle
+
+1. **Submission**: the API validates the request, and in one transaction assigns the event's
+   per-employee sequence number, inserts it as `PENDING`, and records the first history entry.
+2. **Enqueue**: after the transaction commits, a BullMQ job (`{ eventId }` only — the worker
+   never trusts job payload data) is enqueued with `jobId = eventId`, making a redundant enqueue
+   harmless.
+3. **Claim**: the worker atomically claims the job — `PENDING → PROCESSING` — only if no
+   earlier, non-terminal event exists for the same employee.
+4. **Provider call**: outside any database transaction, the worker calls the simulated
+   provider.
+5. **Outcome**:
+   - success → `PROCESSING → SUCCEEDED`, result persisted;
+   - permanent failure → `PROCESSING → FAILED` (`failureType: PERMANENT`), not retried;
+   - transient failure with budget remaining → `PROCESSING → PENDING`, retried by BullMQ with
+     backoff;
+   - transient failure with budget exhausted → `PROCESSING → FAILED` (`failureType: RETRYABLE`).
+6. Every transition above is written to the append-only history table in the same transaction
+   as the status change.
+
+## Failure and Recovery
+
+| Scenario | What happens |
+|---|---|
+| Redis unavailable when enqueuing | The event is already durably `PENDING` in Postgres; the enqueue failure is logged, not returned to the client as an error. The reconciliation sweep re-enqueues it once Redis is reachable again. |
+| Worker crashes mid-processing | The event is left `PROCESSING`. The stale-processing sweep detects it once its `processing_started_at` exceeds the configured timeout and returns it to `PENDING` (or finalizes it as `FAILED` if its attempt budget is already spent). |
+| Transient provider failure | Event returns to `PENDING`; BullMQ redelivers it after an exponential backoff delay, up to a configured attempt budget. |
+| Permanent provider failure | Event goes straight to `FAILED` and is never retried. |
+| BullMQ exhausts its own delivery attempts before the primary path finalizes the event | A `failed`-event listener reconciles the event to `FAILED`/`RETRYABLE` as a backstop. |
+| Duplicate/retried HTTP submission | The `Idempotency-Key` uniqueness constraint ensures only the first insert succeeds; a retry with the same key and the same payload returns the original event. |
+| Two workers race to claim the same event | Only one atomic `UPDATE ... WHERE status = 'PENDING'` can succeed; the other observes zero rows affected and moves on. |
+
+## Testing
+
+All commands run from `backend/` unless noted.
+
+```bash
+npm test          # unit tests (Jest) — no external services required
+npm run test:e2e  # integration/e2e tests — require real PostgreSQL and Redis
+npm run lint       # ESLint
+npm run typecheck  # tsc --noEmit
+npm run build      # nest build
+```
+
+Unit tests live under `backend/src/**/*.spec.ts` (10 suites); integration/e2e tests live under
+`backend/test/*.e2e-spec.ts` (13 suites) and exercise real Postgres and Redis, including
+concurrent-claim races, retry/backoff timing, ordering, stale-processing recovery, and
+reconciliation — not mocked infrastructure.
+
+From `frontend/`, `npm run typecheck` and `npm run build` validate the frontend (there is no
+frontend test framework — the assignment's testing requirements are backend-scenario-focused).
+
+**CI**: `.github/workflows/ci.yml` runs on pull requests and pushes to `main`/`development`, as
+four gated jobs — `verify` (lint, typecheck, build, Prisma schema validation, unit tests) and
+`frontend-verify` (frontend typecheck + build) run first; `e2e` (real Postgres/Redis service
+containers) and `docker-build` (`docker build` for both the backend and frontend images) are
+gated on those passing.
+
+## Frontend
+
+A minimal Next.js (static export, served by nginx in Docker) UI with three screens, consuming
+the real backend API from the browser — not a mocked demo:
+
+- **Events list** (`/`) — table of submitted events with employee/status/type filters and
+  pagination; auto-refreshes periodically.
+- **Submit Event** (`/submit`) — a form whose fields switch based on the selected `eventType`,
+  with client-side validation mirroring the backend's rules (the backend remains authoritative).
+- **Event detail** (`/event`) — full event information, result or failure detail, and the
+  status-history timeline. Polls the event every few seconds until it reaches a terminal state
+  (`SUCCEEDED`/`FAILED`), so processing-state changes are visibly observable, with a bounded
+  number of attempts rather than polling indefinitely.
+
+The frontend also shows the live `/health` status in its navigation bar.
+
+## Design Decisions / Trade-offs
+
+- **`event_type` and `status` are plain `varchar`, not native PostgreSQL enums** — adding a new
+  event type or revising the state machine never requires a schema migration to widen an enum;
+  the value set is enforced at the application layer instead.
+- **No `Employee` table** — the assignment never asks for employee management, and one isn't
+  needed for correctness: per-employee sequence allocation uses a PostgreSQL advisory lock
+  keyed on `employeeId` rather than a row lock against a table that would exist for no other
+  reason.
+- **Idempotency via a database `UNIQUE` constraint plus catching the insert violation**, not a
+  pre-check — the constraint is the only mechanism that is race-free under concurrent identical
+  retries.
+- **Ordering and claiming are combined into one atomic guarded `UPDATE`**, never a
+  check-then-act pair — this is what makes the ordering guarantee correct under concurrent
+  claim attempts for the same employee.
+- **A single BullMQ queue**, not one per employee or event type — per-employee ordering is
+  enforced inside the worker's claim logic, not by queue topology, so cross-employee
+  concurrency is unaffected.
+- **Reconciliation sweeps instead of a transactional outbox/CDC pipeline** — the DB-commit /
+  Redis-enqueue gap is closed with a lightweight periodic sweep rather than a full
+  outbox+log-shipping system, which would be disproportionate machinery for this assignment's
+  scope.
+- **`FAILED` is one terminal state**, not split into separate states per failure kind —
+  `failureType` (`RETRYABLE`/`PERMANENT`) and `failureReason` carry the distinction instead,
+  keeping the state machine smaller.
+- **One backend Docker image, reused for `api`/`worker`/`migrate`** via a `command:` override
+  per Compose service, instead of maintaining separate Dockerfiles for code that is identical
+  except for its entrypoint.
+
+## API / Operational Notes
+
+- API: `http://localhost:3000`
+- Frontend: `http://localhost:3001`
+- Health check: `GET http://localhost:3000/health`
+- Swagger UI: `http://localhost:3000/api` (OpenAPI JSON at `/api-json`)
+- `POST /events` requires an `Idempotency-Key` header — a client-supplied identifier for one
+  logical submission attempt (a UUID is a reasonable choice); omitting it returns `400`.
+
+## Assignment Coverage
+
+- [x] Event submission (`POST /events`, non-blocking)
+- [x] Event status retrieval (`GET /events/:id`)
+- [x] Asynchronous processing via Redis and BullMQ, with a simulated provider
+- [x] Temporary vs. permanent failure handling
+- [x] Duplicate request handling (idempotency)
+- [x] Multiple workers and concurrency safety
+- [x] Worker failure and recovery
+- [x] Processing consistency (crash-after-write scenario)
+- [x] Per-employee event ordering, with concurrent processing across employees
+- [x] Extensibility (new event types require one DTO + one registry entry, not a rewrite)
+- [x] Per-event-type validation
+- [x] Event history and audit information
+- [x] Automated tests (unit + integration/e2e against real infrastructure)
+- [x] `docker compose up` starts API, worker, PostgreSQL, Redis, and the frontend
+- [x] GitHub Actions CI pipeline
+- [x] Error handling and logging at the required lifecycle points
+- [x] Health check endpoint
+- [x] API documentation (Swagger/OpenAPI)
+- [x] Minimal frontend demonstration, consuming the real backend
+- [x] README with setup instructions, architecture, and design trade-offs
+
+## Known Limitations
+
+- No authentication or authorization — explicitly out of scope for this assignment.
+- The simulated provider's random failure rates (`PROVIDER_TRANSIENT_FAILURE_RATE`,
+  `PROVIDER_PERMANENT_FAILURE_RATE`) are for manual/demo purposes; automated tests use
+  deterministic failure triggers instead, not random chance.
+- Provider invocation is at-least-once, not exactly-once, in the narrow crash window described
+  under [Core Guarantees](#core-guarantees) — acceptable only because the provider is simulated
+  and has no real external side effect.
+- Redis and PostgreSQL run without authentication/ACLs beyond a shared local development
+  password — appropriate for local Docker Compose use, not a production configuration.
+- No horizontal-scaling load testing was performed; concurrency correctness is demonstrated
+  through targeted automated tests (concurrent claims, ordering races, idempotent duplicate
+  submissions) rather than large-scale load simulation.
