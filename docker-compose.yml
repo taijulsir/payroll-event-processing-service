@@ -28,12 +28,29 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+  worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ['node', 'dist/worker.js']
+    environment:
+      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
-# The API, worker, and frontend are added in later phases (architecture.md §20/§26) — this
-# file only provides what's needed locally so far: Phase 2's Prisma database layer, and now
-# Phase 4's BullMQ queue. No password/ACL is configured on Redis — this is a local-only
-# development instance with no data worth protecting, matching Postgres's equally simple
-# local credentials above.
+# Same backend image as the (not-yet-added) api service will use, run with a different
+# `command:` (architecture.md §20) — no second Dockerfile. No provider/retry configuration
+# here yet (this phase implements neither). Migrations are still applied manually against
+# Postgres for local development, exactly as in every prior phase; this service does not run
+# them itself, since no phase so far has wired that up (there is no `api` service in this
+# file yet either — see this phase's report for that observation). No password/ACL is
+# configured on Redis — this is a local-only development instance with no data worth
+# protecting, matching Postgres's equally simple local credentials above.
 
 volumes:
   postgres_data:
