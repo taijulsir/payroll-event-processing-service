@@ -737,9 +737,10 @@ them:
 - Complex cloud infrastructure of any kind — the same `docker-compose.yml` used for local
   development is also the deployment mechanism for a single remote host (e.g. a VM), moved
   there via environment variables only (§20). No reverse proxy, TLS termination, container
-  orchestration (Kubernetes, ECS, etc.), or managed cloud service is introduced to support
-  that — a single-host Compose deployment reachable directly over HTTP is the actual target,
-  not a fully productionized cloud architecture.
+  orchestration (Kubernetes, ECS, etc.), or managed cloud service is part of this repository —
+  a single-host Compose deployment is the actual target, not a fully productionized cloud
+  architecture. `api`/`frontend` bind to `127.0.0.1` only; a host-level reverse proxy (outside
+  this repository) is what makes them publicly reachable.
 - Real integration with any external payroll provider.
 
 ## 26. Implementation Phase Mapping

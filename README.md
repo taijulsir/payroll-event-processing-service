@@ -207,16 +207,21 @@ Once running, with default `.env` values:
 
 ### Ports and Exposure
 
-Only two ports are ever published to the host, both configurable (`API_PORT`/`FRONTEND_PORT`
-in the root `.env`), with no source or Compose-file change required to move them:
+Only two ports are ever published to the host, both bound to `127.0.0.1` only and both
+configurable (`API_PORT`/`FRONTEND_PORT` in the root `.env`), with no source or Compose-file
+change required to move them:
 
 | Service | Host exposure | Notes |
 |---|---|---|
-| `frontend` | Public — `${FRONTEND_PORT:-3001}` → container port `80` | Static export served by nginx |
-| `api` | Public — `${API_PORT:-3000}` → container port `${PORT:-3000}` | HTTP API + Swagger UI |
+| `frontend` | `127.0.0.1:${FRONTEND_PORT:-3001}` → container port `80` | Static export served by nginx |
+| `api` | `127.0.0.1:${API_PORT:-3000}` → container port `${PORT:-3000}` | HTTP API + Swagger UI |
 | `worker` | None | No HTTP server; BullMQ consumer only |
 | `postgres` | **None** | No `ports:` mapping at all — reachable only from other containers, as `postgres`, on Compose's internal network, always on port `5432` |
 | `redis` | **None** | Reachable only as `redis`, on the port `REDIS_PORT` configures (`6379` by default) |
+
+Public access, if any, is a separate concern from this Compose file: a host-level reverse
+proxy (e.g. Nginx terminating TLS on `80`/`443`) forwards to these `127.0.0.1` ports. That
+proxy is not part of this repository — see [VM / Remote Deployment](#vm--remote-deployment).
 
 PostgreSQL and Redis are never published to the host on any deployment target, local or
 remote — this is not a production-only hardening step, it is how `docker-compose.yml` is
@@ -292,8 +297,8 @@ or DNS name) and a real database password, for example a VM at `169.58.101.185`:
 PORT=3000
 API_PORT=3000
 FRONTEND_PORT=3001
-FRONTEND_ORIGIN=http://169.58.101.185:3001
-NEXT_PUBLIC_API_BASE_URL=http://169.58.101.185:3000
+FRONTEND_ORIGIN=https://payroll.taijul.dev
+NEXT_PUBLIC_API_BASE_URL=https://payroll.taijul.dev/api
 POSTGRES_PASSWORD=<a real generated password, not the example default>
 ```
 
@@ -301,15 +306,21 @@ POSTGRES_PASSWORD=<a real generated password, not the example default>
 docker compose up --build
 ```
 
-- `FRONTEND_ORIGIN` becomes the API's CORS allowlist entry — it must exactly match the origin
-  the frontend is actually served from, or the browser will reject cross-origin requests.
+- `api`/`frontend` publish to `127.0.0.1` only (see
+  [Ports and Exposure](#ports-and-exposure)) — public HTTPS access requires a host-level
+  reverse proxy (e.g. Nginx on `80`/`443`) forwarding to `127.0.0.1:${API_PORT}` and
+  `127.0.0.1:${FRONTEND_PORT}`. That proxy and any TLS cert are configured outside this
+  repository and outside `docker-compose.yml`.
+- `FRONTEND_ORIGIN` becomes the API's CORS allowlist entry — it must exactly match the public
+  origin the frontend is actually served from (the reverse proxy's domain, not a bare
+  `IP:port`), or the browser will reject cross-origin requests.
 - `NEXT_PUBLIC_API_BASE_URL` is baked into the frontend's static build (see
   [Frontend Configuration](#frontend-configuration-build-time-vs-runtime)) — it must be an
-  address the browser can reach, i.e. the VM's public IP/DNS name and `API_PORT`, never a
-  Compose-internal hostname.
-- `PORT` (the api container's internal listen port) and `API_PORT` (its host mapping) only
-  need to change if `3000` is already in use on the VM — keep them equal. Same for
-  `FRONTEND_PORT`/`3001`.
+  address the browser can reach, i.e. the public domain/path the reverse proxy routes to the
+  API, never a Compose-internal hostname or a `127.0.0.1` address.
+- `PORT` (the api container's internal listen port) and `API_PORT` (its host-loopback
+  mapping) only need to change if `3000` is already in use on the VM — keep them equal. Same
+  for `FRONTEND_PORT`/`3001`.
 - `POSTGRES_PASSWORD` (and `POSTGRES_USER`/`POSTGRES_DB`, if desired) should be changed from
   the `.env.example` default on any VM — it's a value visible in this public repository.
   PostgreSQL is never published to the host either way (see
@@ -319,9 +330,10 @@ docker compose up --build
 - `REDIS_PORT` only needs to change to avoid a conflict on the VM; it is never published to
   the host and has no credentials in this setup.
 - This is a plain Docker Compose deployment to a single host — no reverse proxy, TLS
-  termination, or orchestration layer is introduced here (see
-  [Explicitly Out of Scope](docs/architecture.md#25-explicitly-out-of-scope)); the API and
-  frontend are reachable directly over HTTP on the ports configured above.
+  termination, or orchestration layer is part of this repository (see
+  [Explicitly Out of Scope](docs/architecture.md#25-explicitly-out-of-scope)); a host-level
+  reverse proxy is what makes the API/frontend publicly reachable at all, since Compose only
+  binds them to `127.0.0.1`.
 
 ## Running Locally Without Docker
 
