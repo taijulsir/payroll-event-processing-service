@@ -344,6 +344,24 @@ docker compose up --build
   reverse proxy is what makes the API/frontend publicly reachable at all, since Compose only
   binds them to `127.0.0.1`.
 
+## Live Deployment
+
+This project is deployed and verified live on a self-hosted VM, using exactly the Docker
+Compose setup and architecture described in
+[VM / Remote Deployment](#vm--remote-deployment) above.
+
+- Application: <https://payroll.taijul.dev/>
+- API: <https://payroll.taijul.dev/api/>
+- API health: <https://payroll.taijul.dev/api/health>
+- Swagger UI: <https://payroll.taijul.dev/swagger/>
+
+Nginx runs directly on the VM host (outside Docker) as the public reverse proxy and TLS
+termination layer (Let's Encrypt/Certbot), listening on `80`/`443` and forwarding to the
+`api`/`frontend` containers, which publish their host ports on `127.0.0.1` only (see
+[Ports and Exposure](#ports-and-exposure)). PostgreSQL and Redis have no host port mapping
+and remain reachable only inside the Docker Compose network — the live API health endpoint
+above confirms both are up.
+
 ## Running Locally Without Docker
 
 Requires a reachable PostgreSQL and Redis (for example, `docker compose up postgres redis`)
