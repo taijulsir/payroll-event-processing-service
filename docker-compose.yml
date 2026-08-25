@@ -1,42 +1,40 @@
 services:
+  # No `ports:` — internal-only on every deployment target, reachable only as `postgres`.
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: payroll
-      POSTGRES_PASSWORD: payroll
-      POSTGRES_DB: payroll
-    ports:
-      - '${POSTGRES_PORT:-5432}:5432'
+      POSTGRES_USER: ${POSTGRES_USER:-payroll}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payroll}
+      POSTGRES_DB: ${POSTGRES_DB:-payroll}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U payroll -d payroll']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-payroll} -d ${POSTGRES_DB:-payroll}']
       interval: 5s
       timeout: 5s
       retries: 10
 
+  # No `ports:` — internal-only on every deployment target, reachable only as `redis`.
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - '${REDIS_PORT:-6379}:6379'
+    command: ['redis-server', '--port', '${REDIS_PORT:-6379}']
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test: ['CMD', 'redis-cli', '-p', '${REDIS_PORT:-6379}', 'ping']
       interval: 5s
       timeout: 5s
       retries: 10
 
-  # One-off Prisma migration job; must complete successfully before api/worker start.
   migrate:
     build:
       context: ./backend
       target: build
     command: ['npx', 'prisma', 'migrate', 'deploy']
     environment:
-      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:-payroll}:${POSTGRES_PASSWORD:-payroll}@postgres:5432/${POSTGRES_DB:-payroll}?schema=public
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,14 +45,14 @@ services:
     restart: unless-stopped
     command: ['node', 'dist/main.js']
     environment:
-      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:-payroll}:${POSTGRES_PASSWORD:-payroll}@postgres:5432/${POSTGRES_DB:-payroll}?schema=public
       REDIS_HOST: redis
-      REDIS_PORT: '6379'
-      PORT: '3000'
-      # Must be the browser-reachable frontend origin, not a Compose-internal hostname.
-      FRONTEND_ORIGIN: http://localhost:${FRONTEND_PORT:-3001}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      PORT: ${PORT:-3000}
+      # Must be the browser-reachable frontend origin, never a Compose-internal hostname.
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:${FRONTEND_PORT:-3001}}
     ports:
-      - '${API_PORT:-3000}:3000'
+      - '${API_PORT:-3000}:${PORT:-3000}'
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,9 +67,9 @@ services:
     restart: unless-stopped
     command: ['node', 'dist/worker.js']
     environment:
-      DATABASE_URL: postgresql://payroll:payroll@postgres:5432/payroll?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:-payroll}:${POSTGRES_PASSWORD:-payroll}@postgres:5432/${POSTGRES_DB:-payroll}?schema=public
       REDIS_HOST: redis
-      REDIS_PORT: '6379'
+      REDIS_PORT: ${REDIS_PORT:-6379}
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,12 +78,13 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  # Static Next.js export served by nginx; NEXT_PUBLIC_API_BASE_URL is baked in at build time.
   frontend:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_BASE_URL: http://localhost:${API_PORT:-3000}
+        # Build ARG, not `environment:` — this is a static export with no server at runtime
+        # to read an env var from later. Changing it requires a rebuild, not just a restart.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:${API_PORT:-3000}}
     restart: unless-stopped
     ports:
       - '${FRONTEND_PORT:-3001}:80'
