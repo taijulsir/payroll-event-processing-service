@@ -43,12 +43,24 @@ async function bootstrap() {
   // Minimal Swagger setup (assignment "API Documentation": Swagger/OpenAPI preferred).
   // @nestjs/swagger has been an installed dependency since Phase 1; this just turns it on
   // for the endpoints that exist so far — no custom theming/config beyond the essentials.
-  const swaggerConfig = new DocumentBuilder()
+  const swaggerConfigBuilder = new DocumentBuilder()
     .setTitle('Payroll Event Processing Service')
     .setDescription('API for submitting and tracking payroll events')
-    .setVersion('0.1.0')
-    .build();
-  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
+    .setVersion('0.1.0');
+
+  // Without an explicit `servers` entry, Swagger UI's "Try it out" targets the current page's
+  // own origin with no path prefix — fine locally (routes are reached directly, unprefixed),
+  // but wrong behind a reverse proxy that only exposes this API under a path prefix (e.g.
+  // production's `/api`): requests would miss the proxy's routing entirely. A relative server
+  // URL (OpenAPI 3 allows this) resolves against the browser's origin regardless of where the
+  // Swagger UI page itself is served from, without touching any actual route path. Unset by
+  // default so local behavior is unchanged; set SWAGGER_SERVER_PATH=/api only where this API
+  // is actually reverse-proxied under that prefix.
+  if (process.env.SWAGGER_SERVER_PATH) {
+    swaggerConfigBuilder.addServer(process.env.SWAGGER_SERVER_PATH);
+  }
+
+  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfigBuilder.build());
   SwaggerModule.setup('api', app, swaggerDocument);
 
   const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;

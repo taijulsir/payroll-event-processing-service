@@ -26,6 +26,20 @@ PostgreSQL (never trusts the job payload as truth), and performs the actual stat
 PostgreSQL is authoritative for every fact about an event; Redis holds only pending work, never
 business state.
 
+## Live Deployment
+
+- Application: <https://payroll.taijul.dev/>
+- API: <https://payroll.taijul.dev/api/>
+- API health: <https://payroll.taijul.dev/api/health>
+- Swagger UI: <https://payroll.taijul.dev/swagger/>
+
+Deployed on a self-hosted VM via Docker Compose (see
+[VM / Remote Deployment](#vm--remote-deployment)). Nginx runs on the VM host as the public
+reverse proxy and TLS termination layer (Let's Encrypt/Certbot); the `api`/`frontend`
+containers publish their host ports on `127.0.0.1` only (see
+[Ports and Exposure](#ports-and-exposure)). PostgreSQL and Redis have no host port mapping
+and remain internal to the Compose network.
+
 ## Architecture
 
 ```mermaid
@@ -144,6 +158,7 @@ not read by the application processes directly:
 | `POSTGRES_USER` | `payroll` | PostgreSQL user, passed to the `postgres` container and assembled into `DATABASE_URL` for `migrate`/`api`/`worker` |
 | `POSTGRES_PASSWORD` | `payroll` | PostgreSQL password. **Change this for any deployment reachable by anyone but you** (e.g. a VM) — the default is a known, publicly-visible value in this example file. Postgres itself is never published to the host either way (defense-in-depth, not the only control) |
 | `POSTGRES_DB` | `payroll` | PostgreSQL database name |
+| `SWAGGER_SERVER_PATH` | *(unset)* | Optional public base path for the generated OpenAPI document, passed into the `api` container. Unset for local dev; for the current production reverse proxy, set to `/api` (see [Live Deployment](#live-deployment)) |
 
 `POSTGRES_PORT` is not a root variable — PostgreSQL's internal port never changes (see
 [Ports and Exposure](#ports-and-exposure)); it only appears in
@@ -344,24 +359,6 @@ docker compose up --build
   reverse proxy is what makes the API/frontend publicly reachable at all, since Compose only
   binds them to `127.0.0.1`.
 
-## Live Deployment
-
-This project is deployed and verified live on a self-hosted VM, using exactly the Docker
-Compose setup and architecture described in
-[VM / Remote Deployment](#vm--remote-deployment) above.
-
-- Application: <https://payroll.taijul.dev/>
-- API: <https://payroll.taijul.dev/api/>
-- API health: <https://payroll.taijul.dev/api/health>
-- Swagger UI: <https://payroll.taijul.dev/swagger/>
-
-Nginx runs directly on the VM host (outside Docker) as the public reverse proxy and TLS
-termination layer (Let's Encrypt/Certbot), listening on `80`/`443` and forwarding to the
-`api`/`frontend` containers, which publish their host ports on `127.0.0.1` only (see
-[Ports and Exposure](#ports-and-exposure)). PostgreSQL and Redis have no host port mapping
-and remain reachable only inside the Docker Compose network — the live API health endpoint
-above confirms both are up.
-
 ## Running Locally Without Docker
 
 Requires a reachable PostgreSQL and Redis (for example, `docker compose up postgres redis`)
@@ -392,7 +389,11 @@ Base path: none (routes are mounted at the API root). All responses are JSON.
 | `GET` | `/events` | List submitted events | Query: `employeeId?`, `status?`, `limit?` (default 20, max 100), `offset?` | — | `200` |
 | `GET` | `/events/:id` | Retrieve one event, including its full status history | — | — | `200`, `404` if no event exists with that id |
 
-`GET /api` and `GET /api-json` serve the interactive Swagger UI and the raw OpenAPI document.
+`GET /api` and `GET /api-json` serve the interactive Swagger UI and the raw OpenAPI document —
+these are the API's own internal route paths, unprefixed like every other route above. In
+production, only Swagger UI itself is additionally reachable through the reverse proxy, at
+`/swagger/` (see [Live Deployment](#live-deployment)); the raw JSON document is not currently
+exposed at a public URL.
 
 **Supported `eventType` values and their type-specific fields**:
 
@@ -566,14 +567,15 @@ The frontend also shows the live `/health` status in its navigation bar.
 
 ## API / Operational Notes
 
-Addresses below are local development defaults; on any other deployment target (see
-[VM / Remote Deployment](#vm--remote-deployment)) they follow `API_PORT`/`FRONTEND_PORT`/the
-VM's actual public address instead — never hardcoded in source.
+Addresses below are local development defaults, accessed directly with no reverse proxy; on
+any other deployment target they follow `API_PORT`/`FRONTEND_PORT`/the VM's actual public
+address instead — never hardcoded in source. For the live, publicly reachable URLs (behind
+Nginx's `/api` prefix), see [Live Deployment](#live-deployment).
 
 - API: `http://localhost:3000`
 - Frontend: `http://localhost:3001`
 - Health check: `GET http://localhost:3000/health`
-- Swagger UI: `http://localhost:3000/api` (OpenAPI JSON at `/api-json`)
+- Swagger UI: `http://localhost:3000/api`, raw OpenAPI JSON at `http://localhost:3000/api-json`
 - `POST /events` requires an `Idempotency-Key` header — a client-supplied identifier for one
   logical submission attempt (a UUID is a reasonable choice); omitting it returns `400`.
 
