@@ -1,0 +1,16 @@
+# Local-development only. Copy to `docker-compose.override.yml` (git-ignored, never present
+# on a fresh clone or a VM) to publish PostgreSQL/Redis on 127.0.0.1 for host-side tools
+# (`npm run test:e2e`, `psql`, `redis-cli`, `prisma studio`). Auto-merged by `docker compose`
+# when present — docker-compose.yml alone (what a VM actually runs) never publishes these.
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   docker compose up -d postgres redis
+
+services:
+  postgres:
+    ports:
+      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+
+  redis:
+    ports:
+      - '127.0.0.1:${REDIS_PORT:-6379}:${REDIS_PORT:-6379}'

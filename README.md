@@ -125,23 +125,39 @@ payroll-event-processing-service/
 
 Each `.env.example` file is the source of truth; copy it to `.env` in the same directory to
 override a default. None of the values below are real secrets — they are local-only
-development defaults.
+development defaults. Every deployment-specific value (hostnames, ports, the frontend's
+public origin, the API's public base URL) is environment-driven — changing deployment target
+(local machine, a VM, anywhere else) never requires editing `docker-compose.yml` or any
+application source file, only `.env`.
 
-**Root `.env.example`** — host port overrides consumed only by `docker-compose.yml`'s own
-variable substitution, not read by the application:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `POSTGRES_PORT` | `5432` | Host port mapped to the `postgres` container |
-| `REDIS_PORT` | `6379` | Host port mapped to the `redis` container |
-| `API_PORT` | `3000` | Host port mapped to the `api` container |
-| `FRONTEND_PORT` | `3001` | Host port mapped to the `frontend` container |
-
-**`backend/.env.example`** — read by the API and worker processes:
+**Root `.env.example`** — consumed only by `docker-compose.yml`'s own variable substitution,
+not read by the application processes directly:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PORT` | `3000` | HTTP port the API listens on |
+| `PORT` | `3000` | Port the `api` container's NestJS process listens on internally |
+| `API_PORT` | `3000` | Host port mapped to the `api` container's `PORT` |
+| `FRONTEND_PORT` | `3001` | Host port mapped to the `frontend` container's port `80` |
+| `FRONTEND_ORIGIN` | `http://localhost:3001` | The frontend's browser-reachable origin; passed into the `api` container as `FRONTEND_ORIGIN` (CORS allowlist). For a VM/remote deployment, set this to the public origin the frontend is actually served at |
+| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:3000` | The API's browser-reachable base URL; passed to the `frontend` image as a **build ARG** and baked into the static export (see [Frontend Configuration](#frontend-configuration-build-time-vs-runtime) below). For a VM/remote deployment, set this to the API's actual public address |
+| `REDIS_PORT` | `6379` | Port the `redis` container listens on internally and that `api`/`worker` connect to. Not published to the host by default |
+| `POSTGRES_USER` | `payroll` | PostgreSQL user, passed to the `postgres` container and assembled into `DATABASE_URL` for `migrate`/`api`/`worker` |
+| `POSTGRES_PASSWORD` | `payroll` | PostgreSQL password. **Change this for any deployment reachable by anyone but you** (e.g. a VM) — the default is a known, publicly-visible value in this example file. Postgres itself is never published to the host either way (defense-in-depth, not the only control) |
+| `POSTGRES_DB` | `payroll` | PostgreSQL database name |
+
+`POSTGRES_PORT` is not a root variable — PostgreSQL's internal port never changes (see
+[Ports and Exposure](#ports-and-exposure)); it only appears in
+`docker-compose.override.yml.example` for optional local host access.
+`POSTGRES_USER`/`PASSWORD`/`DB` only take effect on first initialization of an empty
+`postgres_data` volume — changing them later requires `docker compose down -v` to reset it.
+
+**`backend/.env.example`** — read by the API and worker processes when run directly (outside
+Docker Compose; under Compose, `docker-compose.yml`'s own `environment:` block supplies these
+instead, itself driven by the root `.env` above):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `3000` | HTTP port the API listens on — deployment-specific, never hardcoded (`main.ts` reads `process.env.PORT`) |
 | `NODE_ENV` | `development` | Standard Node environment flag |
 | `FRONTEND_ORIGIN` | `http://localhost:3001` | The single allowed CORS origin — must be the browser-reachable frontend URL, never a Docker-internal hostname |
 | `DATABASE_URL` | `postgresql://payroll:payroll@localhost:5432/payroll?schema=public` | Prisma/PostgreSQL connection string |
@@ -151,8 +167,11 @@ The simulated payroll provider (`backend/src/processing/simulated-payroll-provid
 environment configuration — it is deterministic, not randomized (see
 [Known Limitations](#known-limitations)).
 
-**`frontend/.env.example`** — read at build time only (this is a static export; there is no
-frontend server at runtime):
+**`frontend/.env.example`** — read at build time only, when building the frontend directly
+(outside Docker; this is a static export, there is no frontend server at runtime to read an
+environment variable from later). Under Docker Compose, the root `.env`'s
+`NEXT_PUBLIC_API_BASE_URL` (passed as a build ARG) is used instead — see
+[Frontend Configuration](#frontend-configuration-build-time-vs-runtime).
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -179,12 +198,66 @@ This starts, in dependency order:
 multi-stage image, selected via a different `command:` per service) — there is no second
 backend Dockerfile. `frontend` builds from its own `frontend/Dockerfile`.
 
-Once running:
+Once running, with default `.env` values:
 
 - API: `http://localhost:3000`
 - Health check: `http://localhost:3000/health`
 - Swagger UI: `http://localhost:3000/api`
 - Frontend: `http://localhost:3001`
+
+### Ports and Exposure
+
+Only two ports are ever published to the host, both configurable (`API_PORT`/`FRONTEND_PORT`
+in the root `.env`), with no source or Compose-file change required to move them:
+
+| Service | Host exposure | Notes |
+|---|---|---|
+| `frontend` | Public — `${FRONTEND_PORT:-3001}` → container port `80` | Static export served by nginx |
+| `api` | Public — `${API_PORT:-3000}` → container port `${PORT:-3000}` | HTTP API + Swagger UI |
+| `worker` | None | No HTTP server; BullMQ consumer only |
+| `postgres` | **None** | No `ports:` mapping at all — reachable only from other containers, as `postgres`, on Compose's internal network, always on port `5432` |
+| `redis` | **None** | Reachable only as `redis`, on the port `REDIS_PORT` configures (`6379` by default) |
+
+PostgreSQL and Redis are never published to the host on any deployment target, local or
+remote — this is not a production-only hardening step, it is how `docker-compose.yml` is
+written. `docker-compose.override.yml.example` (git-ignored once copied, never present on a
+fresh clone or a VM) is the only way to publish them, on `127.0.0.1` only, for local tools
+that need direct access (`npm run test:e2e`, `psql`, `redis-cli`).
+
+## Frontend Configuration (Build-Time vs Runtime)
+
+The frontend is a Next.js **static export** (`output: 'export'` in `next.config.ts`) — `next
+build` produces plain HTML/JS/CSS served by nginx, with no Node.js process and no server at
+runtime. This has one direct consequence for configuration: **there is nothing running at
+request time that could read a runtime environment variable.** Any value the frontend needs —
+here, just the API's base URL — has to be resolved at build time and inlined into the
+JavaScript bundle, using Next.js's own `NEXT_PUBLIC_*` convention
+(`frontend/lib/api.ts` reads `process.env.NEXT_PUBLIC_API_BASE_URL`, falling back to
+`http://localhost:3000` only if it was never supplied at build time).
+
+In `docker-compose.yml`, this is wired as a build **ARG**, not a container `environment:`
+entry — an `environment:` value would have no effect, since nothing reads it after the static
+files are already baked:
+
+```yaml
+frontend:
+  build:
+    args:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:${API_PORT:-3000}}
+```
+
+Practical implications:
+- Changing `NEXT_PUBLIC_API_BASE_URL` requires `docker compose build frontend` (or `up
+  --build`) — restarting the container alone has no effect, because the value is already
+  compiled into the JavaScript.
+- The value must be an address the **browser** can reach — never a Compose-internal service
+  name like `http://api:3000`, which only resolves between containers, not from the user's
+  machine.
+- No fake "runtime config" shim (e.g. an injected `window.__ENV__` fetched from a JSON file at
+  page load) was introduced to work around this — that would be extra moving parts solving a
+  problem this architecture doesn't actually have: a full rebuild on config change is a
+  correct and sufficient answer for a static export this size, not a limitation to engineer
+  around.
 
 ## Database Migrations
 
@@ -201,6 +274,54 @@ npm run prisma:migrate:deploy   # apply existing migrations (non-interactive)
 npm run prisma:migrate:dev      # create/apply a migration during local development
 npm run prisma:validate         # validate schema.prisma without connecting to a database
 ```
+
+## VM / Remote Deployment
+
+The same `docker-compose.yml` used for local development runs unchanged on a VM — nothing in
+this repository needs to be edited to change deployment target, only `.env`. On the VM:
+
+```bash
+cp .env.example .env
+```
+
+Then set the values that must reflect where the VM is actually reachable from (its public IP
+or DNS name) and a real database password, for example a VM at `169.58.101.185`:
+
+```bash
+# .env
+PORT=3000
+API_PORT=3000
+FRONTEND_PORT=3001
+FRONTEND_ORIGIN=http://169.58.101.185:3001
+NEXT_PUBLIC_API_BASE_URL=http://169.58.101.185:3000
+POSTGRES_PASSWORD=<a real generated password, not the example default>
+```
+
+```bash
+docker compose up --build
+```
+
+- `FRONTEND_ORIGIN` becomes the API's CORS allowlist entry — it must exactly match the origin
+  the frontend is actually served from, or the browser will reject cross-origin requests.
+- `NEXT_PUBLIC_API_BASE_URL` is baked into the frontend's static build (see
+  [Frontend Configuration](#frontend-configuration-build-time-vs-runtime)) — it must be an
+  address the browser can reach, i.e. the VM's public IP/DNS name and `API_PORT`, never a
+  Compose-internal hostname.
+- `PORT` (the api container's internal listen port) and `API_PORT` (its host mapping) only
+  need to change if `3000` is already in use on the VM — keep them equal. Same for
+  `FRONTEND_PORT`/`3001`.
+- `POSTGRES_PASSWORD` (and `POSTGRES_USER`/`POSTGRES_DB`, if desired) should be changed from
+  the `.env.example` default on any VM — it's a value visible in this public repository.
+  PostgreSQL is never published to the host either way (see
+  [Ports and Exposure](#ports-and-exposure)), so this is defense-in-depth, not the only
+  control. Set it before the first `docker compose up`; changing it later requires
+  `docker compose down -v` to reset the data volume.
+- `REDIS_PORT` only needs to change to avoid a conflict on the VM; it is never published to
+  the host and has no credentials in this setup.
+- This is a plain Docker Compose deployment to a single host — no reverse proxy, TLS
+  termination, or orchestration layer is introduced here (see
+  [Explicitly Out of Scope](docs/architecture.md#25-explicitly-out-of-scope)); the API and
+  frontend are reachable directly over HTTP on the ports configured above.
 
 ## Running Locally Without Docker
 
@@ -394,8 +515,21 @@ The frontend also shows the live `/health` status in its navigation bar.
 - **One backend Docker image, reused for `api`/`worker`/`migrate`** via a `command:` override
   per Compose service, instead of maintaining separate Dockerfiles for code that is identical
   except for its entrypoint.
+- **PostgreSQL and Redis are never published to the host** — no `ports:` mapping in
+  `docker-compose.yml` on any deployment target. `api`/`worker` reach them only through
+  Docker's internal service-name DNS, which is identical whether running locally or on a VM.
+- **Deployment-specific values (host ports, the frontend's public origin, the API's public
+  base URL) are entirely environment-driven** — moving from local development to a VM changes
+  only `.env`, never `docker-compose.yml` or application source. The frontend's API base URL
+  is the one exception that must be a Docker build ARG rather than a plain env var, because
+  it is a static export with no server at runtime to read one from later (see
+  [Frontend Configuration](#frontend-configuration-build-time-vs-runtime)).
 
 ## API / Operational Notes
+
+Addresses below are local development defaults; on any other deployment target (see
+[VM / Remote Deployment](#vm--remote-deployment)) they follow `API_PORT`/`FRONTEND_PORT`/the
+VM's actual public address instead — never hardcoded in source.
 
 - API: `http://localhost:3000`
 - Frontend: `http://localhost:3001`

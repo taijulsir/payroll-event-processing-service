@@ -614,12 +614,29 @@ flowchart TB
   (`node dist/main.js` vs. `node dist/worker.js`) — not two separate Dockerfiles, since the
   two entrypoints share the same compiled application code.
 - **postgres** and **redis** — standard images, each with a named volume for local data
-  persistence across restarts.
+  persistence across restarts. **Neither publishes a host port** — no `ports:` entry in
+  `docker-compose.yml`, on any deployment target. They are reachable only from other
+  containers, by service name, on Compose's internal network; this is not a
+  production-specific hardening step, it is how the file is written.
 - **frontend** — a small static build served by a lightweight server, its own container.
 - **Networking**: Compose's default network; services address each other by service name
   (`postgres`, `redis`) rather than `localhost`.
 - **Environment configuration**: `.env` (git-ignored) populated from the committed
-  `.env.example`; each service receives only the variables it needs.
+  `.env.example`; each service receives only the variables it needs. Every deployment-specific
+  value — the api container's listen port (`PORT`) and its host mapping (`API_PORT`), the
+  frontend's host mapping (`FRONTEND_PORT`), the frontend's CORS-allowlisted origin
+  (`FRONTEND_ORIGIN`), the API's browser-reachable base URL (`NEXT_PUBLIC_API_BASE_URL`),
+  PostgreSQL credentials (`POSTGRES_USER`/`PASSWORD`/`DB`), and the Redis port (`REDIS_PORT`,
+  used by both the `redis` container and `api`/`worker`) — is read from `.env` with a
+  `localhost`-based default, never hardcoded in `docker-compose.yml` or application source.
+  This is what lets the same Compose file target a different host (e.g. a VM's public IP)
+  with only an `.env` change; see `README.md`'s "VM / Remote Deployment" section.
+  `NEXT_PUBLIC_API_BASE_URL` is the one value supplied as a Docker build ARG rather than a
+  plain `environment:` entry, because the frontend is a static export with no server at
+  runtime to read an environment variable from later — changing it requires rebuilding the
+  `frontend` image, not just restarting it. PostgreSQL's internal port (`5432`) is fixed and
+  not environment-driven, unlike Redis's — a deliberate asymmetry, since only Redis's own
+  listen port needed to move as a unit with what `api`/`worker` connect to.
 - **Health checks**: Compose-level health checks on `postgres`/`redis` so `api`/`worker` don't
   start racing against a database that isn't ready yet; the API's own `GET /health` is the
   application-level equivalent, checked externally (e.g. by a person, or CI) rather than by
@@ -717,8 +734,12 @@ them:
 - An `employees` table or any HR-system-adjacent domain modeling.
 - Advanced frontend architecture: state-management libraries, WebSockets/SSE, complex routing,
   visual design investment beyond clarity.
-- Complex cloud infrastructure of any kind — this system's deployment target is local Docker
-  Compose only.
+- Complex cloud infrastructure of any kind — the same `docker-compose.yml` used for local
+  development is also the deployment mechanism for a single remote host (e.g. a VM), moved
+  there via environment variables only (§20). No reverse proxy, TLS termination, container
+  orchestration (Kubernetes, ECS, etc.), or managed cloud service is introduced to support
+  that — a single-host Compose deployment reachable directly over HTTP is the actual target,
+  not a fully productionized cloud architecture.
 - Real integration with any external payroll provider.
 
 ## 26. Implementation Phase Mapping
