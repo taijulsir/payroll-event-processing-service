@@ -148,8 +148,12 @@ not read by the application processes directly:
 `POSTGRES_PORT` is not a root variable — PostgreSQL's internal port never changes (see
 [Ports and Exposure](#ports-and-exposure)); it only appears in
 `docker-compose.override.yml.example` for optional local host access.
-`POSTGRES_USER`/`PASSWORD`/`DB` only take effect on first initialization of an empty
-`postgres_data` volume — changing them later requires `docker compose down -v` to reset it.
+`POSTGRES_USER`/`PASSWORD`/`DB` only take effect when PostgreSQL initializes an **empty**
+`postgres_data` volume. On an existing deployment, editing `.env` afterward does **not**
+change the running database's actual role password — that role must be changed directly in
+PostgreSQL (e.g. `ALTER USER ... WITH PASSWORD ...`), with `.env`/`DATABASE_URL` then updated
+to match. `docker compose down -v` deletes the volume and all data with it; it is not a
+credential-rotation procedure.
 
 **`backend/.env.example`** — read by the API and worker processes when run directly (outside
 Docker Compose; under Compose, `docker-compose.yml`'s own `environment:` block supplies these
@@ -290,7 +294,8 @@ cp .env.example .env
 ```
 
 Then set the values that must reflect where the VM is actually reachable from (its public IP
-or DNS name) and a real database password, for example a VM at `169.58.101.185`:
+or DNS name) and a real database password, for example a VM with a public IP address or DNS
+name:
 
 ```bash
 # .env
@@ -325,8 +330,12 @@ docker compose up --build
   the `.env.example` default on any VM — it's a value visible in this public repository.
   PostgreSQL is never published to the host either way (see
   [Ports and Exposure](#ports-and-exposure)), so this is defense-in-depth, not the only
-  control. Set it before the first `docker compose up`; changing it later requires
-  `docker compose down -v` to reset the data volume.
+  control. Set it in `.env` **before** the first `docker compose up`, so PostgreSQL
+  initializes its empty volume with that password directly.
+  To rotate the credential on an **existing** deployment, change the role's password inside
+  PostgreSQL itself first, then update `.env`/`DATABASE_URL` to match — editing `.env` alone
+  has no effect on an already-initialized database. `docker compose down -v` deletes the
+  data volume; it is a destructive last resort, never a normal way to change a password.
 - `REDIS_PORT` only needs to change to avoid a conflict on the VM; it is never published to
   the host and has no credentials in this setup.
 - This is a plain Docker Compose deployment to a single host — no reverse proxy, TLS
